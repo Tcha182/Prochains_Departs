@@ -79,7 +79,8 @@ ExecStartPost=/bin/rm -f /boot/firmware/setup-pi.sh
 ExecStartPost=/bin/systemctl disable first-setup.service
 ExecStartPost=/sbin/reboot
 RemainAfterExit=yes
-TimeoutStartSec=600
+StandardOutput=journal+console
+TimeoutStartSec=1800
 
 [Install]
 WantedBy=multi-user.target

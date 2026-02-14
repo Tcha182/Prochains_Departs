@@ -19,12 +19,15 @@ apt-get update && apt-get install -y --no-install-recommends \
     python3-pyqt5 \
     git
 
+echo "==> Setting timezone..."
+timedatectl set-timezone Europe/Paris
+
 echo "==> Installing uv..."
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="/root/.local/bin:$PATH"
 
 echo "==> Installing Python dependencies..."
-uv pip install --system requests python-dotenv
+uv pip install --system --break-system-packages requests python-dotenv
 
 echo "==> Setting up automatic OS updates..."
 apt-get install -y --no-install-recommends unattended-upgrades
@@ -96,7 +99,7 @@ echo "==> Installing systemd service..."
 cat > /etc/systemd/system/departure-display.service << 'UNIT'
 [Unit]
 Description=Departure Display
-After=graphical.target
+After=multi-user.target
 
 [Service]
 Type=simple
@@ -108,7 +111,7 @@ Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 systemctl enable departure-display

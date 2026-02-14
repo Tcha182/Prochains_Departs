@@ -349,15 +349,9 @@ class SleepOverlay(QWidget):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
 
-        moon = QLabel(Icons.MOON)
-        moon.setAlignment(Qt.AlignCenter)
-        moon.setFont(icon_font(64))
-        moon.setStyleSheet("color: #484f58; background-color: black;")
-        layout.addWidget(moon)
-
-        hint = QLabel("Appuyez pour reactiver")
+        hint = QLabel("Appuyez pour activer")
         hint.setAlignment(Qt.AlignCenter)
-        hint.setStyleSheet("color: #484f58; font-size: 16px; background-color: black;")
+        hint.setStyleSheet("color: #484f58; font-size: 28px; background-color: black;")
         layout.addWidget(hint)
 
     def mousePressEvent(self, event):
@@ -714,13 +708,11 @@ class SettingsScreen(QWidget):
 
     def _mask_token(self):
         """Mask the current API token for display."""
-        import api
-        token = api.API_TOKEN
+        from api import get_api_token
+        token = get_api_token()
         if not token or token == "your-api-token-here":
             return "Non configure"
-        if len(token) <= 8:
-            return "\u2022" * len(token)
-        return token[:4] + "\u2022\u2022\u2022\u2022" + token[-4:]
+        return self._mask_token_str(token)
 
     def _on_save_api(self):
         token = self.api_input.text().strip()
@@ -1276,7 +1268,7 @@ class VirtualKeyboard(QFrame):
         if key == "\u2423":
             return "espace"
         if key == "\u21e7":
-            return Icons.BACK if False else "\u21e7"
+            return "\u21e7"
         if key == "\u232b":
             return "\u232b"
         return key

@@ -79,9 +79,11 @@ def load_favourites() -> List[Favourite]:
 
 
 def save_favourites(favourites: List[Favourite]) -> None:
-    """Save favourites to JSON file."""
-    with open(FAVOURITES_PATH, "w", encoding="utf-8") as f:
+    """Save favourites to JSON file (atomic write)."""
+    tmp_path = FAVOURITES_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump([asdict(fav) for fav in favourites], f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, FAVOURITES_PATH)
 
 
 # ─── App Settings ─────────────────────────────────────────────────────────────
@@ -107,16 +109,19 @@ def load_settings() -> AppSettings:
 
 
 def save_settings(settings: AppSettings) -> None:
-    """Save app settings to JSON file."""
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+    """Save app settings to JSON file (atomic write)."""
+    tmp_path = SETTINGS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(asdict(settings), f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, SETTINGS_PATH)
 
 
 def save_api_token(token: str) -> None:
     """Write API token to .env file and update runtime variable."""
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    with open(env_path, "w", encoding="utf-8") as f:
+    tmp_path = env_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(f"API_TOKEN={token}\n")
-    # Update runtime variable (local import to avoid circular)
-    import api
-    api.API_TOKEN = token
+    os.replace(tmp_path, env_path)
+    from api import set_api_token
+    set_api_token(token)

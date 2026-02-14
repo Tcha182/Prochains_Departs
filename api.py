@@ -15,6 +15,23 @@ from models import Favourite, Departure, LineAtStop, StopOnLine, normalize, is_s
 load_dotenv()
 API_TOKEN = os.getenv("API_TOKEN", "")
 
+
+def get_api_token() -> str:
+    """Return the current API token."""
+    return API_TOKEN
+
+
+def set_api_token(token: str) -> None:
+    """Update the runtime API token."""
+    global API_TOKEN
+    API_TOKEN = token
+
+
+def _sanitize_odsql(value: str) -> str:
+    """Remove double quotes from a value for safe use in ODSQL where clauses."""
+    return value.replace('"', '')
+
+
 SIRI_URL = "https://prim.iledefrance-mobilites.fr/marketplace/stop-monitoring"
 OPEN_DATA_BASE = "https://data.iledefrance-mobilites.fr/api/explore/v2.1"
 STOPS_DATASET = "arrets"
@@ -42,50 +59,54 @@ class DepartureWorker(QObject):
         self.favourites = favourites
 
     def run(self):
-        results = {}
-        # Group favourites by unique (stop_area_id, line_id) to minimize API calls
-        groups = {}
-        for fav in self.favourites:
-            key = (fav.stop_area_id, fav.line_id)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(fav)
+        try:
+            results = {}
+            # Group favourites by unique (stop_area_id, line_id) to minimize API calls
+            groups = {}
+            for fav in self.favourites:
+                key = (fav.stop_area_id, fav.line_id)
+                if key not in groups:
+                    groups[key] = []
+                groups[key].append(fav)
 
-        for (stop_area_id, line_id), favs in groups.items():
-            try:
-                headers = {"apikey": API_TOKEN}
-                params = {
-                    "MonitoringRef": f"STIF:StopArea:SP:{stop_area_id}:",
-                    "LineRef": f"STIF:Line::{line_id}:",
-                }
-                resp = requests.get(SIRI_URL, headers=headers, params=params,
-                                    timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                fetch_ts = time.time()
-                data = resp.json()
+            for (stop_area_id, line_id), favs in groups.items():
+                try:
+                    headers = {"apikey": get_api_token()}
+                    params = {
+                        "MonitoringRef": f"STIF:StopArea:SP:{stop_area_id}:",
+                        "LineRef": f"STIF:Line::{line_id}:",
+                    }
+                    resp = requests.get(SIRI_URL, headers=headers, params=params,
+                                        timeout=REQUEST_TIMEOUT)
+                    resp.raise_for_status()
+                    fetch_ts = time.time()
+                    data = resp.json()
 
-                all_departures = self._parse_departures(data, fetch_ts)
+                    all_departures = self._parse_departures(data, fetch_ts)
 
-                # Distribute departures to each favourite based on direction
-                for fav in favs:
-                    fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
-                    stop_norm = normalize(fav.stop_name)
-                    matched = [
-                        d for d in all_departures
-                        if d.eta_seconds >= 0
-                        and fav.destination_name.lower() in d.destination.lower()
-                        and (not fav.direction or d.direction_ref == fav.direction)
-                        and not is_same_place(stop_norm, normalize(d.destination))
-                    ]
-                    matched.sort(key=lambda d: d.expected_iso or "")
-                    results[fav_key] = matched[:5]
+                    # Distribute departures to each favourite based on direction
+                    for fav in favs:
+                        fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
+                        stop_norm = normalize(fav.stop_name)
+                        matched = [
+                            d for d in all_departures
+                            if d.eta_seconds >= 0
+                            and fav.destination_name.lower() in d.destination.lower()
+                            and (not fav.direction or d.direction_ref == fav.direction)
+                            and not is_same_place(stop_norm, normalize(d.destination))
+                        ]
+                        matched.sort(key=lambda d: d.expected_iso or "")
+                        results[fav_key] = matched[:5]
 
-            except requests.RequestException as e:
-                self.error.emit(f"Erreur réseau: {e}")
-            except (KeyError, ValueError) as e:
-                self.error.emit(f"Erreur données: {e}")
+                except requests.RequestException as e:
+                    self.error.emit(f"Erreur réseau: {e}")
+                except (KeyError, ValueError) as e:
+                    self.error.emit(f"Erreur données: {e}")
 
-        self.finished.emit(results)
+            self.finished.emit(results)
+        except Exception as e:
+            self.error.emit(f"Erreur inattendue: {e}")
+            self.finished.emit({})
 
     def _parse_departures(self, data, fetch_ts):
         departures = []
@@ -166,9 +187,9 @@ class LineSearchWorker(QObject):
             url = f"{OPEN_DATA_BASE}/catalog/datasets/{LINES_DATASET}/records"
             where_parts = []
             if self.query:
-                where_parts.append(f'search(shortname_line, "{self.query}")')
+                where_parts.append(f'search(shortname_line, "{_sanitize_odsql(self.query)}")')
             if self.mode:
-                where_parts.append(f'transportmode="{self.mode}"')
+                where_parts.append(f'transportmode="{_sanitize_odsql(self.mode)}"')
             params = {
                 "select": "id_line,shortname_line,name_line,transportmode,colourweb_hexa,textcolourweb_hexa",
                 "limit": 20,
@@ -196,6 +217,9 @@ class LineSearchWorker(QObject):
         except requests.RequestException as e:
             self.error.emit(f"Erreur recherche: {e}")
             self.finished.emit([], self.search_id)
+        except Exception as e:
+            self.error.emit(f"Erreur inattendue: {e}")
+            self.finished.emit([], self.search_id)
 
 
 # ─── Stops On Line Worker ───────────────────────────────────────────────────
@@ -214,7 +238,7 @@ class StopsOnLineWorker(QObject):
         try:
             url = f"{OPEN_DATA_BASE}/catalog/datasets/{STOP_LINES_DATASET}/records"
             params = {
-                "where": f'id="{self.route_id}"',
+                "where": f'id="{_sanitize_odsql(self.route_id)}"',
                 "limit": 100,
                 "select": "stop_name,stop_id",
             }
@@ -239,6 +263,9 @@ class StopsOnLineWorker(QObject):
         except requests.RequestException as e:
             self.error.emit(f"Erreur arrets: {e}")
             self.finished.emit([])
+        except Exception as e:
+            self.error.emit(f"Erreur inattendue: {e}")
+            self.finished.emit([])
 
 
 # ─── Resolve + Direction Probe Worker ──────────────────────────────────────
@@ -260,24 +287,28 @@ class ResolveAndProbeWorker(QObject):
         self.line_id = line_id
 
     def run(self):
-        # Step 1: Resolve stop_id → stop_area_id
         try:
-            stop_area_id, stop_name = self._resolve()
-            if not stop_area_id:
+            # Step 1: Resolve stop_id → stop_area_id
+            try:
+                stop_area_id, stop_name = self._resolve()
+                if not stop_area_id:
+                    self.finished.emit("", "", [])
+                    return
+            except requests.RequestException as e:
+                self.error.emit(f"Erreur resolution: {e}")
                 self.finished.emit("", "", [])
                 return
-        except requests.RequestException as e:
-            self.error.emit(f"Erreur resolution: {e}")
-            self.finished.emit("", "", [])
-            return
 
-        # Step 2: Probe SIRI for directions (may fail independently)
-        try:
-            directions = self._probe_directions(stop_area_id)
-            self.finished.emit(stop_area_id, stop_name, directions)
-        except requests.RequestException as e:
-            self.error.emit(f"Erreur directions: {e}")
-            self.finished.emit(stop_area_id, stop_name, [])
+            # Step 2: Probe SIRI for directions (may fail independently)
+            try:
+                directions = self._probe_directions(stop_area_id)
+                self.finished.emit(stop_area_id, stop_name, directions)
+            except requests.RequestException as e:
+                self.error.emit(f"Erreur directions: {e}")
+                self.finished.emit(stop_area_id, stop_name, [])
+        except Exception as e:
+            self.error.emit(f"Erreur inattendue: {e}")
+            self.finished.emit("", "", [])
 
     def _resolve(self):
         """Resolve stop_id to (stop_area_id, stop_name)."""
@@ -289,7 +320,7 @@ class ResolveAndProbeWorker(QObject):
         arr_id = self.stop_id.split(":")[-1] if ":" in self.stop_id else self.stop_id
         url = f"{OPEN_DATA_BASE}/catalog/datasets/{STOPS_DATASET}/records"
         params = {
-            "where": f'arrid="{arr_id}"',
+            "where": f'arrid="{_sanitize_odsql(arr_id)}"',
             "limit": 1,
             "select": "arrname,zdaid",
         }
@@ -306,7 +337,7 @@ class ResolveAndProbeWorker(QObject):
 
     def _probe_directions(self, stop_area_id):
         """Probe SIRI to discover destination names + direction refs."""
-        headers = {"apikey": API_TOKEN}
+        headers = {"apikey": get_api_token()}
         params = {
             "MonitoringRef": f"STIF:StopArea:SP:{stop_area_id}:",
             "LineRef": f"STIF:Line::{self.line_id}:",
@@ -375,6 +406,8 @@ class WiFiScanWorker(QObject):
             self.finished.emit([{"ssid": "WiFi non disponible", "signal": 0, "security": "", "in_use": False}])
         except (subprocess.TimeoutExpired, OSError):
             self.finished.emit([])
+        except Exception:
+            self.finished.emit([])
 
 
 # ─── WiFi Connect Worker ────────────────────────────────────────────────────
@@ -406,6 +439,8 @@ class WiFiConnectWorker(QObject):
             self.finished.emit(False, "Delai d'attente depasse")
         except OSError as e:
             self.finished.emit(False, str(e))
+        except Exception as e:
+            self.finished.emit(False, f"Erreur inattendue: {e}")
 
 
 # ─── Helper: create and start a worker on a thread ──────────────────────────
