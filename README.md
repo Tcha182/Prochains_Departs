@@ -9,26 +9,26 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 - **Multi-mode search**: Bus, Metro, Tramway, Train/RER with transport type icons
 - **Direction filtering**: Choose which direction to monitor at each stop
 - **Live countdowns**: Updated every second from SIRI Lite real-time data
-- **Favourites**: Saved locally, persisted across restarts
+- **Favourites**: Saved locally with atomic writes (crash-safe)
 - **Auto-refresh**: Every 1 minute (pauses 2am-5am)
-- **Touch-optimised**: 800x480 layout with kinetic scrolling
-- **Settings screen**: API token, WiFi configuration, theme, sleep mode
+- **Touch-optimised**: 800x480 layout with kinetic scrolling and virtual AZERTY keyboard
+- **Settings screen**: API token, WiFi configuration, theme, sleep delay
 - **WiFi configuration**: Scan and connect to networks via nmcli
 - **Dark/light theme**: Toggle between themes in settings
-- **Sleep mode**: Screen dims during configurable overnight hours
+- **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake
 - **Kiosk mode**: Auto-fullscreen and hidden cursor on Raspberry Pi
 
 ## Architecture
 
 | File | Role |
 |---|---|
-| `main.py` | Entry point, MainWindow, timers, navigation |
-| `widgets.py` | UI widgets (HomeScreen, SearchScreen, SettingsScreen, SleepOverlay) |
+| `main.py` | Entry point, MainWindow, timers, navigation, sleep mode |
+| `widgets.py` | UI widgets (HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard) |
 | `api.py` | QThread-based API workers (SIRI Lite, IDFM Open Data, WiFi) |
-| `models.py` | Dataclasses, shared helpers, JSON persistence |
-| `styles.py` | QSS theme stylesheets (dark and light) |
+| `models.py` | Dataclasses, shared helpers, JSON persistence (atomic writes) |
+| `styles.py` | QSS theme stylesheets and Material Icons helpers |
 
-API workers run on background `QThread`s. The main thread handles UI updates and countdown interpolation.
+API workers run on background `QThread`s with catch-all error handling to prevent thread leaks. The main thread handles UI updates and countdown interpolation.
 
 ## Requirements
 
@@ -108,20 +108,21 @@ sudo reboot
 ### After setup
 
 The Pi is fully autonomous:
+- Timezone set to `Europe/Paris`
 - Auto-login on tty1, starts X11 with Openbox
-- App launches via systemd (`departure-display.service`)
-- Restarts automatically if it crashes
+- App launches via systemd (`departure-display.service`, `After=multi-user.target`)
+- Restarts automatically if it crashes (`Restart=always`)
 - OS security updates install daily, auto-reboot at 4am if needed
 - Hardware watchdog reboots the Pi if it freezes
 
-### Updating
+### Updating the app
 
 ```bash
-ssh pi@<ip>
+ssh pi@prochains-departs.local
 cd /home/pi/app && ./update.sh
 ```
 
-This pulls the latest code from GitHub and restarts the service.
+This pulls the latest code from GitHub and restarts the service. There is no automatic app update — OS patches are automatic, but app code only updates when you run `update.sh`.
 
 ## Project Structure
 
@@ -134,8 +135,9 @@ This pulls the latest code from GitHub and restarts the service.
 ├── styles.py                     QSS stylesheets + icon helpers
 ├── MaterialIcons-Regular.ttf     Material Icons font (Google)
 ├── test_app.py                   Test suite
-├── setup-pi.sh                   Pi setup script (native systemd deployment)
+├── setup-pi.sh                   Pi setup script (packages, systemd, watchdog, timezone)
 ├── prepare-sd.ps1                Windows script to prepare SD card for autonomous setup
+├── update.sh                     Created on the Pi by setup-pi.sh — pulls code and restarts
 └── .env                          API token (not committed)
 ```
 
