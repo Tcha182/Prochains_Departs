@@ -48,11 +48,11 @@ class MainWindow(QMainWindow):
         self._setup_timers()
         self._detect_kiosk()
 
-        # Initial fetch
+        # Show current state immediately, then fetch data
+        self.home.populate(self.favourites, self.departure_map, self._delete_favourite)
         if self.favourites:
+            self.home.set_updated_time("Chargement...")
             QTimer.singleShot(500, self._refresh_departures)
-        else:
-            self.home.populate(self.favourites, self.departure_map, self._delete_favourite)
 
     def _setup_ui(self):
         self.stack = QStackedWidget()
