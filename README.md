@@ -74,36 +74,54 @@ pytest test_app.py -v -m live
 
 Target: Raspberry Pi 4 + official 7" touchscreen (800x480) running Raspberry Pi OS Lite (Bookworm, 64-bit).
 
-### One-time setup
+### Autonomous setup (no keyboard needed)
 
-```bash
-chmod +x setup-pi.sh
-sudo ./setup-pi.sh
+1. **Flash the SD card** with [Raspberry Pi Imager](https://www.raspberrypi.com/software/). Choose *Raspberry Pi OS Lite (64-bit)* and click the settings icon to configure:
+   - Username: `pi`, set a password
+   - Enable SSH (for remote access later)
+   - Configure WiFi (SSID + password), or use Ethernet
+
+2. **Prepare the SD card** — with the SD card still in the reader, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File prepare-sd.ps1
 ```
 
-This installs Python dependencies natively, sets up a minimal X11 environment (Xorg + Openbox), configures auto-login, and creates a systemd service for the app.
+3. **Eject, insert, power on.** The Pi handles everything automatically:
+   - First boot: creates user, connects to WiFi, reboots
+   - Second boot: installs packages, clones the app from GitHub, reboots
+   - Third boot: the app starts on the touchscreen
+
+4. **Enter your API token** via the Settings screen on the touchscreen (or via SSH: `nano /home/pi/app/.env`).
+
+### Manual setup (via SSH)
+
+If you prefer to set up manually, flash with Raspberry Pi Imager (configure user + SSH + WiFi), boot the Pi, then:
+
+```bash
+ssh pi@raspberrypi.local
+curl -sSL https://raw.githubusercontent.com/Tcha182/Prochains_Departs/main/setup-pi.sh | sudo bash
+nano /home/pi/app/.env   # set your API token
+sudo reboot
+```
 
 ### After setup
 
-1. Edit `/home/pi/app/.env` with your real API token
-2. Reboot
-
-The Pi will:
-- Auto-login on tty1
-- Start X11 with Openbox
-- Launch the app via systemd (`departure-display.service`)
-- Restart the app automatically if it crashes
+The Pi is fully autonomous:
+- Auto-login on tty1, starts X11 with Openbox
+- App launches via systemd (`departure-display.service`)
+- Restarts automatically if it crashes
+- OS security updates install daily, auto-reboot at 4am if needed
+- Hardware watchdog reboots the Pi if it freezes
 
 ### Updating
-
-SSH into the Pi and run the update script:
 
 ```bash
 ssh pi@<ip>
 cd /home/pi/app && ./update.sh
 ```
 
-This pulls the latest code from git and restarts the systemd service.
+This pulls the latest code from GitHub and restarts the service.
 
 ## Project Structure
 
@@ -116,7 +134,8 @@ This pulls the latest code from git and restarts the systemd service.
 ├── styles.py                     QSS stylesheets + icon helpers
 ├── MaterialIcons-Regular.ttf     Material Icons font (Google)
 ├── test_app.py                   Test suite
-├── setup-pi.sh                   One-time Pi setup script
+├── setup-pi.sh                   Pi setup script (native systemd deployment)
+├── prepare-sd.ps1                Windows script to prepare SD card for autonomous setup
 └── .env                          API token (not committed)
 ```
 
