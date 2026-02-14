@@ -112,17 +112,20 @@ The Pi is fully autonomous:
 - Auto-login on tty1, starts X11 with Openbox
 - App launches via systemd (`departure-display.service`, `After=multi-user.target`)
 - Restarts automatically if it crashes (`Restart=always`)
+- App updates daily at 3:30am from GitHub (only restarts if code changed)
 - OS security updates install daily, auto-reboot at 4am if needed
 - Hardware watchdog reboots the Pi if it freezes
 
 ### Updating the app
 
+The app automatically checks for updates daily at 3:30am (via a systemd timer). If new code is found on GitHub, it pulls and restarts the service. OS security patches are also automatic (via `unattended-upgrades`).
+
+To update manually:
+
 ```bash
 ssh pi@prochains-departs.local
 cd /home/pi/app && ./update.sh
 ```
-
-This pulls the latest code from GitHub and restarts the service. There is no automatic app update — OS patches are automatic, but app code only updates when you run `update.sh`.
 
 ## Project Structure
 

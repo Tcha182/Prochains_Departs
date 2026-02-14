@@ -121,11 +121,46 @@ cat > "$APP_DIR/update.sh" << 'UPDATE'
 #!/usr/bin/env bash
 set -euo pipefail
 cd /home/pi/app
+before=$(git rev-parse HEAD)
 git pull
-sudo systemctl restart departure-display
-echo "Update complete."
+after=$(git rev-parse HEAD)
+if [ "$before" != "$after" ]; then
+    sudo systemctl restart departure-display
+    echo "Updated and restarted."
+else
+    echo "Already up to date."
+fi
 UPDATE
 chmod +x "$APP_DIR/update.sh"
+
+echo "==> Scheduling daily app updates..."
+cat > /etc/systemd/system/app-update.service << 'AUUNIT'
+[Unit]
+Description=Update Prochains Departs from GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/app
+ExecStart=/home/pi/app/update.sh
+AUUNIT
+
+cat > /etc/systemd/system/app-update.timer << 'AUTIMER'
+[Unit]
+Description=Daily app update check
+
+[Timer]
+OnCalendar=*-*-* 03:30
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+AUTIMER
+systemctl daemon-reload
+systemctl enable app-update.timer
 
 echo "==> Writing .xinitrc..."
 cat > "/home/$PI_USER/.xinitrc" << 'XINITRC'
