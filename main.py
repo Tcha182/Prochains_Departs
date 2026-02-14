@@ -10,7 +10,7 @@ import platform
 from datetime import datetime
 
 from PyQt5.QtCore import Qt, QTimer, QEvent
-from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget
+from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget, QLineEdit
 
 from models import (
     Favourite, load_favourites, save_favourites,
@@ -21,7 +21,7 @@ from api import (
     ResolveAndProbeWorker, WiFiScanWorker, WiFiConnectWorker,
     start_worker,
 )
-from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay
+from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard
 from styles import DARK_THEME, set_theme, get_theme, load_icon_font
 
 WINDOW_WIDTH = 800
@@ -88,6 +88,10 @@ class MainWindow(QMainWindow):
         self.settings_screen.api_token_saved.connect(self._on_api_token_saved)
         self.stack.addWidget(self.settings_screen)
 
+        # Virtual keyboard (child widget, overlays at bottom)
+        self.keyboard = VirtualKeyboard(self)
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
+
         # Sleep overlay (child widget, overlays everything)
         self.sleep_overlay = SleepOverlay(self)
         self.sleep_overlay.tapped.connect(self._wake_up)
@@ -115,9 +119,23 @@ class MainWindow(QMainWindow):
             self.setCursor(Qt.BlankCursor)
 
     def resizeEvent(self, event):
-        """Keep sleep overlay sized to the full window."""
+        """Keep overlays sized to the full window."""
         super().resizeEvent(event)
         self.sleep_overlay.setGeometry(self.rect())
+        # Position keyboard at the bottom
+        kb_h = 220
+        self.keyboard.setGeometry(0, self.height() - kb_h, self.width(), kb_h)
+
+    def _on_focus_changed(self, old, new):
+        """Show/hide virtual keyboard when QLineEdit gains/loses focus."""
+        if isinstance(new, QLineEdit):
+            self.keyboard.set_target(new)
+            kb_h = 220
+            self.keyboard.setGeometry(0, self.height() - kb_h, self.width(), kb_h)
+            self.keyboard.show()
+            self.keyboard.raise_()
+        else:
+            self.keyboard.hide()
 
     # ── Event tracking for sleep mode ─────────────────────────────────────────
 

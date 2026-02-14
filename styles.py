@@ -107,6 +107,37 @@ _SETTINGS_QSS_DARK = """
 #saveBtn:pressed {
     background-color: #2ea043;
 }
+/* ── Virtual keyboard ── */
+#virtualKeyboard {
+    background-color: #161b22;
+    border-top: 1px solid #30363d;
+}
+#kbKey {
+    background-color: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #e6edf3;
+    font-size: 16px;
+    font-weight: bold;
+    min-width: 36px;
+    min-height: 38px;
+}
+#kbKey:pressed {
+    background-color: #30363d;
+}
+#kbKeyOk {
+    background-color: #238636;
+    border: none;
+    border-radius: 6px;
+    color: #ffffff;
+    font-size: 14px;
+    font-weight: bold;
+    min-width: 72px;
+    min-height: 38px;
+}
+#kbKeyOk:pressed {
+    background-color: #2ea043;
+}
 """
 
 _SETTINGS_QSS_LIGHT = """
@@ -164,6 +195,37 @@ _SETTINGS_QSS_LIGHT = """
     padding: 0 20px;
 }
 #saveBtn:pressed {
+    background-color: #218739;
+}
+/* ── Virtual keyboard ── */
+#virtualKeyboard {
+    background-color: #f6f8fa;
+    border-top: 1px solid #d0d7de;
+}
+#kbKey {
+    background-color: #ffffff;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    color: #1f2328;
+    font-size: 16px;
+    font-weight: bold;
+    min-width: 36px;
+    min-height: 38px;
+}
+#kbKey:pressed {
+    background-color: #d0d7de;
+}
+#kbKeyOk {
+    background-color: #1a7f37;
+    border: none;
+    border-radius: 6px;
+    color: #ffffff;
+    font-size: 14px;
+    font-weight: bold;
+    min-width: 72px;
+    min-height: 38px;
+}
+#kbKeyOk:pressed {
     background-color: #218739;
 }
 """

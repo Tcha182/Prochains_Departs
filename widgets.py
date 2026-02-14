@@ -1,4 +1,4 @@
-"""UI widgets: DepartureCard, FavouriteGroup, HomeScreen, SearchScreen, SettingsScreen, SleepOverlay."""
+"""UI widgets: DepartureCard, FavouriteGroup, HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard."""
 
 import os
 import time
@@ -1209,3 +1209,111 @@ class SearchScreen(QWidget):
         self.stop_loading.setText("")
         self.dir_loading.setText("")
         self.stack.setCurrentIndex(0)
+
+
+# ─── Virtual Keyboard ──────────────────────────────────────────────────────
+
+class VirtualKeyboard(QFrame):
+    """On-screen AZERTY keyboard for touchscreen input."""
+
+    ROWS_LOWER = [
+        list("1234567890"),
+        list("azertyuiop"),
+        list("qsdfghjklm"),
+        ["\u21e7", "w", "x", "c", "v", "b", "n", "\u232b"],
+        ["\u2423", "@", "-", ".", "#", "&", "OK"],
+    ]
+    ROWS_UPPER = [
+        list("!\"#$%&*()_"),
+        list("AZERTYUIOP"),
+        list("QSDFGHJKLM"),
+        ["\u21e7", "W", "X", "C", "V", "B", "N", "\u232b"],
+        ["\u2423", "@", "-", ".", "#", "&", "OK"],
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("virtualKeyboard")
+        self._target = None
+        self._shifted = False
+        self._key_buttons = []
+        self._setup_ui()
+        self.hide()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(3)
+
+        for row_keys in self.ROWS_LOWER:
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(3)
+            for key in row_keys:
+                btn = QPushButton(self._display_text(key))
+                btn.setObjectName("kbKey")
+                btn.setFocusPolicy(Qt.NoFocus)
+                btn.setMinimumHeight(38)
+
+                if key == "\u2423":  # space
+                    btn.setSizePolicy(btn.sizePolicy())
+                    btn.setMinimumWidth(180)
+                elif key == "\u21e7":  # shift
+                    btn.setMinimumWidth(56)
+                elif key == "\u232b":  # backspace
+                    btn.setMinimumWidth(56)
+                elif key == "OK":
+                    btn.setMinimumWidth(72)
+                    btn.setObjectName("kbKeyOk")
+
+                btn.clicked.connect(lambda checked, k=key: self._on_key(k))
+                row_layout.addWidget(btn)
+                self._key_buttons.append((key, btn))
+
+            layout.addLayout(row_layout)
+
+    def _display_text(self, key):
+        if key == "\u2423":
+            return "espace"
+        if key == "\u21e7":
+            return Icons.BACK if False else "\u21e7"
+        if key == "\u232b":
+            return "\u232b"
+        return key
+
+    def set_target(self, widget):
+        self._target = widget
+
+    def _on_key(self, key):
+        if not self._target:
+            return
+
+        if key == "\u21e7":  # shift
+            self._shifted = not self._shifted
+            self._update_case()
+        elif key == "\u232b":  # backspace
+            self._target.backspace()
+        elif key == "OK":
+            self.hide()
+        elif key == "\u2423":  # space
+            self._target.insert(" ")
+        else:
+            char = key.upper() if self._shifted and key.isalpha() else key
+            self._target.insert(char)
+            if self._shifted:
+                self._shifted = False
+                self._update_case()
+
+    def _update_case(self):
+        rows = self.ROWS_UPPER if self._shifted else self.ROWS_LOWER
+        flat = [k for row in rows for k in row]
+        for i, (orig_key, btn) in enumerate(self._key_buttons):
+            if i < len(flat):
+                new_key = flat[i]
+                btn.setText(self._display_text(new_key))
+                # Rebind click to the new key
+                try:
+                    btn.clicked.disconnect()
+                except TypeError:
+                    pass
+                btn.clicked.connect(lambda checked, k=new_key: self._on_key(k))
+                self._key_buttons[i] = (new_key, btn)
