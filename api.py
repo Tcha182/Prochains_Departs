@@ -152,13 +152,14 @@ class DepartureWorker(QObject):
 class LineSearchWorker(QObject):
     """Searches lines by number/name via IDFM referentiel-des-lignes."""
 
-    finished = pyqtSignal(list)  # [LineAtStop, ...]
+    finished = pyqtSignal(list, int)  # [LineAtStop, ...], search_id
     error = pyqtSignal(str)
 
-    def __init__(self, query: str, mode: str = ""):
+    def __init__(self, query: str, mode: str = "", search_id: int = 0):
         super().__init__()
         self.query = query
         self.mode = mode
+        self.search_id = search_id
 
     def run(self):
         try:
@@ -170,7 +171,7 @@ class LineSearchWorker(QObject):
                 where_parts.append(f'transportmode="{self.mode}"')
             params = {
                 "select": "id_line,shortname_line,name_line,transportmode,colourweb_hexa,textcolourweb_hexa",
-                "limit": 30,
+                "limit": 20,
             }
             if where_parts:
                 params["where"] = " AND ".join(where_parts)
@@ -191,10 +192,10 @@ class LineSearchWorker(QObject):
                 ))
 
             results.sort(key=lambda l: _natural_sort_key(l.line_name))
-            self.finished.emit(results)
+            self.finished.emit(results, self.search_id)
         except requests.RequestException as e:
             self.error.emit(f"Erreur recherche: {e}")
-            self.finished.emit([])
+            self.finished.emit([], self.search_id)
 
 
 # ─── Stops On Line Worker ───────────────────────────────────────────────────

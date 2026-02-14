@@ -308,7 +308,8 @@ class MainWindow(QMainWindow):
     # ── Search API calls ─────────────────────────────────────────────────────
 
     def _on_line_search(self, query: str, mode: str):
-        self._launch_worker(LineSearchWorker(query, mode), self.search.on_line_results)
+        search_id = self.search._search_id
+        self._launch_worker(LineSearchWorker(query, mode, search_id), self.search.on_line_results)
 
     def _on_stops_on_line(self, route_id: str):
         self._launch_worker(StopsOnLineWorker(route_id), self.search.on_stop_results)

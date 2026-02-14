@@ -778,8 +778,9 @@ class SearchScreen(QWidget):
         self._resolved_stop_name = ""
         self._debounce_timer = QTimer()
         self._debounce_timer.setSingleShot(True)
-        self._debounce_timer.setInterval(400)
+        self._debounce_timer.setInterval(600)
         self._debounce_timer.timeout.connect(self._do_search)
+        self._search_id = 0  # incremented on each search to ignore stale results
         self._setup_ui()
 
     def _setup_ui(self):
@@ -915,19 +916,19 @@ class SearchScreen(QWidget):
 
     def _on_search_text_changed(self, text):
         self._debounce_timer.stop()
-        if len(text.strip()) >= 1:
-            self._debounce_timer.start()
-        else:
-            # Empty input: reload all lines for the mode
-            self._do_search()
+        self._debounce_timer.start()
 
     def _do_search(self):
+        self._search_id += 1
         query = self.search_input.text().strip()
         self.line_loading.setText("Recherche...")
         self.line_search_requested.emit(query, self.selected_mode)
 
-    def on_line_results(self, lines: list):
+    def on_line_results(self, lines: list, search_id: int = 0):
         """Called when line search results arrive."""
+        # Ignore stale results from earlier searches
+        if search_id and search_id != self._search_id:
+            return
         self.line_loading.setText("")
         self._clear_layout(self.line_results_layout)
 
