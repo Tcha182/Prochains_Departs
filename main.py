@@ -267,6 +267,10 @@ class MainWindow(QMainWindow):
     def _wake_up(self):
         self._sleeping = False
         self._last_interaction_time = time.time()
+        # Clear stale departures before showing the screen
+        self.departure_map.clear()
+        self._rebuild_home()
+        self.home.set_updated_time("Chargement...")
         self.sleep_overlay.hide()
         self.refresh_timer.start()
         self.countdown_timer.start()
