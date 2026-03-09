@@ -61,6 +61,9 @@ max-load-1 = 24
 WDCONF
 systemctl enable watchdog
 
+echo "==> Granting pi network management permissions..."
+usermod -aG netdev "$PI_USER"
+
 echo "==> Configuring auto-login on tty1..."
 mkdir -p /etc/systemd/system/getty@tty1.service.d
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'AUTOLOGIN'
