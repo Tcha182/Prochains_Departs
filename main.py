@@ -4,10 +4,13 @@ Entry point: MainWindow with auto-refresh, countdown interpolation, and favourit
 """
 
 import glob
+import os
+import subprocess
 import sys
 import time
 import platform
 from datetime import datetime
+from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget, QLineEdit
@@ -47,6 +50,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_timers()
         self._detect_kiosk()
+        self._apply_boot_wifi()
 
         # Show current state immediately, then fetch data
         self.home.populate(self.favourites, self.departure_map, self._delete_favourite)
@@ -117,6 +121,37 @@ class MainWindow(QMainWindow):
         if "arm" in arch or "aarch" in arch:
             self.showFullScreen()
             self.setCursor(Qt.BlankCursor)
+
+    def _apply_boot_wifi(self):
+        """Connect to WiFi from a config file on the boot partition.
+
+        If /boot/firmware/wifi.txt exists with lines SSID and PASSWORD,
+        connect via nmcli then delete the file.  This lets you configure
+        WiFi by dropping a text file on the SD card's FAT32 boot partition
+        from any computer — no Linux/WSL needed.
+        """
+        wifi_file = Path("/boot/firmware/wifi.txt")
+        if not wifi_file.is_file():
+            return
+        try:
+            lines = wifi_file.read_text().strip().splitlines()
+            if len(lines) < 2:
+                return
+            ssid, password = lines[0].strip(), lines[1].strip()
+            if not ssid:
+                return
+            # Delete stale connection profile, then connect
+            subprocess.run(
+                ["nmcli", "connection", "delete", ssid],
+                capture_output=True, timeout=10,
+            )
+            subprocess.run(
+                ["nmcli", "device", "wifi", "connect", ssid, "password", password],
+                capture_output=True, timeout=30,
+            )
+            wifi_file.unlink()
+        except Exception:
+            pass
 
     def resizeEvent(self, event):
         """Keep overlays sized to the full window."""

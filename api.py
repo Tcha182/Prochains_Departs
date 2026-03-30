@@ -373,8 +373,19 @@ class WiFiScanWorker(QObject):
 
     finished = pyqtSignal(list)  # [{"ssid", "signal", "security", "in_use"}, ...]
 
+    @staticmethod
+    def _split_nmcli_line(line):
+        """Split nmcli -t line on unescaped colons (nmcli escapes : as \\:)."""
+        parts = re.split(r'(?<!\\):', line)
+        return [p.replace('\\:', ':').replace('\\\\', '\\') for p in parts]
+
     def run(self):
         try:
+            # Ensure WiFi radio is on
+            subprocess.run(
+                ["nmcli", "radio", "wifi", "on"],
+                capture_output=True, timeout=5,
+            )
             result = subprocess.run(
                 ["nmcli", "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY",
                  "device", "wifi", "list", "--rescan", "yes"],
@@ -383,7 +394,7 @@ class WiFiScanWorker(QObject):
             networks = []
             seen = set()
             for line in result.stdout.strip().splitlines():
-                parts = line.split(":")
+                parts = self._split_nmcli_line(line)
                 if len(parts) < 4:
                     continue
                 in_use = parts[0].strip() == "*"
@@ -392,7 +403,7 @@ class WiFiScanWorker(QObject):
                     continue
                 seen.add(ssid)
                 signal = int(parts[2]) if parts[2].isdigit() else 0
-                security = parts[3].strip()
+                security = ":".join(parts[3:]).strip()
                 networks.append({
                     "ssid": ssid,
                     "signal": signal,
@@ -424,6 +435,12 @@ class WiFiConnectWorker(QObject):
 
     def run(self):
         try:
+            # Delete any existing connection profile for this SSID so nmcli
+            # uses the freshly-provided password instead of stale credentials.
+            subprocess.run(
+                ["nmcli", "connection", "delete", self.ssid],
+                capture_output=True, text=True, timeout=10,
+            )
             cmd = ["nmcli", "device", "wifi", "connect", self.ssid]
             if self.password:
                 cmd += ["password", self.password]
