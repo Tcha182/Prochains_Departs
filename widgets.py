@@ -542,6 +542,12 @@ class SettingsScreen(QWidget):
         self.wifi_pw_input.setPlaceholderText("Mot de passe...")
         self.wifi_pw_input.setEchoMode(QLineEdit.Password)
         pw_layout.addWidget(self.wifi_pw_input)
+        self._pw_visible = False
+        pw_eye_btn = QPushButton(Icons.VISIBILITY_OFF)
+        pw_eye_btn.setObjectName("headerBtn")
+        pw_eye_btn.setFont(icon_font(18))
+        pw_eye_btn.clicked.connect(lambda: self._toggle_pw_visibility(pw_eye_btn))
+        pw_layout.addWidget(pw_eye_btn)
         self.wifi_connect_btn = QPushButton("Connecter")
         self.wifi_connect_btn.setObjectName("saveBtn")
         self.wifi_connect_btn.clicked.connect(self._on_connect_pressed)
@@ -564,6 +570,15 @@ class SettingsScreen(QWidget):
 
         self._selected_ssid = ""
         self.stack.addWidget(page)
+
+    def _toggle_pw_visibility(self, btn):
+        self._pw_visible = not self._pw_visible
+        if self._pw_visible:
+            self.wifi_pw_input.setEchoMode(QLineEdit.Normal)
+            btn.setText(Icons.VISIBILITY)
+        else:
+            self.wifi_pw_input.setEchoMode(QLineEdit.Password)
+            btn.setText(Icons.VISIBILITY_OFF)
 
     def _on_scan_pressed(self):
         self.wifi_status.setText("Recherche...")

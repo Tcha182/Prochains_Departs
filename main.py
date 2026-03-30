@@ -50,6 +50,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_timers()
         self._detect_kiosk()
+        self._ensure_network_permissions()
         self._apply_boot_wifi()
 
         # Show current state immediately, then fetch data
@@ -121,6 +122,32 @@ class MainWindow(QMainWindow):
         if "arm" in arch or "aarch" in arch:
             self.showFullScreen()
             self.setCursor(Qt.BlankCursor)
+
+    def _ensure_network_permissions(self):
+        """Install polkit rule so the app can manage WiFi without root.
+
+        The app runs as a systemd service (inactive session), so the default
+        NetworkManager polkit policy blocks WiFi changes.  This creates a
+        rule that allows the netdev group to manage networking.
+        """
+        rule = Path("/etc/polkit-1/rules.d/10-network-manager.rules")
+        if rule.exists():
+            return
+        try:
+            content = (
+                'polkit.addRule(function(action, subject) {\n'
+                '    if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 &&\n'
+                '        subject.isInGroup("netdev")) {\n'
+                '        return polkit.Result.YES;\n'
+                '    }\n'
+                '});\n'
+            )
+            subprocess.run(
+                ["sudo", "tee", str(rule)],
+                input=content, capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            pass
 
     def _apply_boot_wifi(self):
         """Connect to WiFi from a config file on the boot partition.

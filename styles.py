@@ -28,6 +28,8 @@ class Icons:
     LOCK = "\ue897"         # lock
     CHECK = "\ue5ca"        # check
     MOON = "\ue3a8"         # brightness_3
+    VISIBILITY = "\ue8f4"   # visibility
+    VISIBILITY_OFF = "\ue8f5"  # visibility_off
 
 
 def load_icon_font():

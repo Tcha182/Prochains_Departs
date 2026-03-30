@@ -63,6 +63,14 @@ systemctl enable watchdog
 
 echo "==> Granting pi network management permissions..."
 usermod -aG netdev "$PI_USER"
+cat > /etc/polkit-1/rules.d/10-network-manager.rules << 'POLKIT'
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 &&
+        subject.isInGroup("netdev")) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
 
 echo "==> Configuring auto-login on tty1..."
 mkdir -p /etc/systemd/system/getty@tty1.service.d
