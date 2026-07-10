@@ -500,6 +500,12 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     font-weight: bold;
     padding: 4px 12px;
 }
+
+/* ── Tap feedback flash ── */
+#resultItem[tapFlash="true"], #wifiItem[tapFlash="true"],
+#settingsRow[tapFlash="true"], #modeBtn[tapFlash="true"] {
+    background-color: #21262d;
+}
 """ + _SETTINGS_QSS_DARK
 
 # ─── Light theme ──────────────────────────────────────────────────────────────
@@ -771,6 +777,12 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     font-size: 14px;
     font-weight: bold;
     padding: 4px 12px;
+}
+
+/* ── Tap feedback flash ── */
+#resultItem[tapFlash="true"], #wifiItem[tapFlash="true"],
+#settingsRow[tapFlash="true"], #modeBtn[tapFlash="true"] {
+    background-color: #eaeef2;
 }
 """ + _SETTINGS_QSS_LIGHT
 

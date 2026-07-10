@@ -109,6 +109,9 @@ WorkingDirectory=/home/pi/app
 ExecStart=/usr/bin/python3 /home/pi/app/main.py
 Restart=always
 RestartSec=5
+# App pings WATCHDOG=1 every 30s; restart it if it hangs (frozen UI)
+WatchdogSec=120
+NotifyAccess=main
 
 [Install]
 WantedBy=multi-user.target
