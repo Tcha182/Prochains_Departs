@@ -4,10 +4,11 @@ import os
 import time
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QEvent
 from PyQt5.QtWidgets import (
     QWidget, QFrame, QLabel, QVBoxLayout, QHBoxLayout, QScrollArea,
-    QPushButton, QLineEdit, QStackedWidget, QScroller, QGridLayout,
+    QPushButton, QLineEdit, QStackedWidget, QScroller, QScrollerProperties,
+    QGridLayout, QApplication,
 )
 
 from models import Favourite, Departure, LineAtStop, StopOnLine, normalize, is_same_place
@@ -23,6 +24,69 @@ TRANSPORT_MODES = [
 TRANSPORT_MODE_LABELS = {mode: label for label, mode, _icon in TRANSPORT_MODES}
 
 
+# ─── Touch helpers ───────────────────────────────────────────────────────────
+
+def make_touch_scroll_area() -> QScrollArea:
+    """Vertical-only scroll area with kinetic touch scrolling enabled."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    viewport = scroll.viewport()
+    QScroller.grabGesture(viewport, QScroller.LeftMouseButtonGesture)
+    scroller = QScroller.scroller(viewport)
+    props = scroller.scrollerProperties()
+    # Overshoot animations can leave the view stuck offset on slow devices,
+    # and horizontal wobble fights the vertical-only layout.
+    props.setScrollMetric(QScrollerProperties.HorizontalOvershootPolicy,
+                          QScrollerProperties.OvershootAlwaysOff)
+    props.setScrollMetric(QScrollerProperties.VerticalOvershootPolicy,
+                          QScrollerProperties.OvershootAlwaysOff)
+    # By default QScroller replays a withheld press into the child widget
+    # after 0.25s, so resting a finger briefly before swiping presses the
+    # item under it. Items in these scroll areas all activate on release,
+    # so withhold the press for the whole gesture: a tap is replayed as
+    # press+release on release, and a drag only ever scrolls.
+    props.setScrollMetric(QScrollerProperties.MousePressEventDelay, 3600.0)
+    scroller.setScrollerProperties(props)
+    return scroll
+
+
+class TappableFrame(QFrame):
+    """Clickable frame safe to use inside a QScroller scroll area.
+
+    Emits `tapped` on release only if the press didn't turn into a scroll
+    drag — activating on press would fire while the user is trying to scroll.
+    """
+
+    tapped = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self._press_pos = None
+
+    def mousePressEvent(self, event):
+        self._press_pos = event.pos()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        press_pos, self._press_pos = self._press_pos, None
+        if press_pos is not None:
+            moved = (event.pos() - press_pos).manhattanLength()
+            if moved <= QApplication.startDragDistance() and self.rect().contains(event.pos()):
+                self.tapped.emit()
+        event.accept()
+
+    def event(self, event):
+        # QScroller cancels a stolen press by ungrabbing the mouse.
+        if event.type() == QEvent.UngrabMouse:
+            self._press_pos = None
+        return super().event(event)
+
+
 # ─── DepartureCard ───────────────────────────────────────────────────────────
 
 class DepartureCard(QFrame):
@@ -36,6 +100,7 @@ class DepartureCard(QFrame):
         self.departure = departure
         self.fetch_timestamp = departure.fetch_timestamp
         self.eta_seconds = departure.eta_seconds
+        self._countdown_shown = None  # (text, state, theme) of last render
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -112,26 +177,31 @@ class DepartureCard(QFrame):
     def update_countdown(self):
         """Recompute countdown from fetch_timestamp + eta_seconds."""
         if self.eta_seconds <= 0:
-            self.countdown_label.setText("--")
+            self._render_countdown("--", None)
             return
         elapsed = time.time() - self.fetch_timestamp
         remaining = self.eta_seconds - elapsed
-        colors = THEME_COLORS[get_theme()]
         if remaining < -30:
-            self.countdown_label.setText("Parti")
-            self.countdown_label.setStyleSheet(
-                f"color: {colors['countdown_departed']}; font-size: 22px; font-weight: bold;"
-            )
+            self._render_countdown("Parti", "countdown_departed")
         elif remaining < 60:
-            self.countdown_label.setText("< 1 min")
-            self.countdown_label.setStyleSheet(
-                f"color: {colors['countdown_imminent']}; font-size: 22px; font-weight: bold;"
-            )
+            self._render_countdown("< 1 min", "countdown_imminent")
         else:
-            minutes = int(remaining / 60)
-            self.countdown_label.setText(f"{minutes} min")
+            # Round to whole seconds first so timer jitter can't flip
+            # e.g. 480.0s into "7 min" a tick early.
+            minutes = int(round(remaining)) // 60
+            self._render_countdown(f"{minutes} min", "countdown_normal")
+
+    def _render_countdown(self, text: str, color_key):
+        """Apply text/style only when changed — a stylesheet update every
+        second forces a relayout, which stutters scrolling on the Pi."""
+        theme = get_theme()
+        if self._countdown_shown == (text, color_key, theme):
+            return
+        self._countdown_shown = (text, color_key, theme)
+        self.countdown_label.setText(text)
+        if color_key:
             self.countdown_label.setStyleSheet(
-                f"color: {colors['countdown_normal']}; font-size: 22px; font-weight: bold;"
+                f"color: {THEME_COLORS[theme][color_key]}; font-size: 22px; font-weight: bold;"
             )
 
 
@@ -207,6 +277,11 @@ class HomeScreen(QWidget):
         super().__init__(parent)
         self.edit_mode = False
         self.groups = []
+        self._pending_populate = None
+        self._populate_retry = QTimer(self)
+        self._populate_retry.setSingleShot(True)
+        self._populate_retry.setInterval(250)
+        self._populate_retry.timeout.connect(self._apply_pending_populate)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -250,12 +325,8 @@ class HomeScreen(QWidget):
         layout.addWidget(header)
 
         # ── Scroll area
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll = make_touch_scroll_area()
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        # Enable touch scrolling
-        QScroller.grabGesture(self.scroll.viewport(), QScroller.LeftMouseButtonGesture)
 
         self.scroll_content = QWidget()
         self.scroll_layout = QVBoxLayout(self.scroll_content)
@@ -296,17 +367,45 @@ class HomeScreen(QWidget):
         self.edit_toggled.emit()
 
     def populate(self, favourites, departure_map, delete_callback=None):
-        """Rebuild the scroll area with favourite groups."""
-        # Clear old groups
+        """Rebuild the scroll area with favourite groups.
+
+        Deferred while a touch scroll gesture is in flight: tearing the
+        widgets out from under the finger kills the gesture mid-scroll.
+        """
+        self._pending_populate = (list(favourites), dict(departure_map), delete_callback)
+        scroller = QScroller.scroller(self.scroll.viewport())
+        if scroller.state() != QScroller.Inactive:
+            self._populate_retry.start()
+            return
+        self._apply_pending_populate()
+
+    def _apply_pending_populate(self):
+        if self._pending_populate is None:
+            return
+        favourites, departure_map, delete_callback = self._pending_populate
+        self._pending_populate = None
+
+        scroller = QScroller.scroller(self.scroll.viewport())
+        if scroller.state() != QScroller.Inactive:
+            self._pending_populate = (favourites, departure_map, delete_callback)
+            self._populate_retry.start()
+            return
+
+        scroll_pos = self.scroll.verticalScrollBar().value()
+
+        # Clear old groups (keep the reusable empty-state label alive)
         self.groups.clear()
         while self.scroll_layout.count() > 0:
             item = self.scroll_layout.takeAt(0)
             widget = item.widget()
-            if widget:
+            if widget is self.empty_label:
+                widget.setParent(None)
+            elif widget:
                 widget.deleteLater()
 
         if not favourites:
             self.scroll_layout.addWidget(self.empty_label)
+            self.empty_label.show()
             self.scroll_layout.addStretch()
             return
 
@@ -320,6 +419,8 @@ class HomeScreen(QWidget):
             self.scroll_layout.addWidget(group)
 
         self.scroll_layout.addStretch()
+        # Restore scroll position once the new content has been laid out
+        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(scroll_pos))
 
     def update_countdowns(self):
         """Called every second to update all departure countdowns."""
@@ -426,25 +527,23 @@ class SettingsScreen(QWidget):
 
         # WiFi row
         wifi_row = self._make_settings_row("WiFi", Icons.CHEVRON_RIGHT)
-        wifi_row.mousePressEvent = lambda e: self._open_wifi()
+        wifi_row.tapped.connect(self._open_wifi)
         content_layout.addWidget(wifi_row)
 
         # API key row
         api_row = self._make_settings_row("Cle API", Icons.CHEVRON_RIGHT)
-        api_row.mousePressEvent = lambda e: self._open_api()
+        api_row.tapped.connect(self._open_api)
         content_layout.addWidget(api_row)
 
         # Theme row
         theme_label = "Sombre" if self._theme == "dark" else "Clair"
         self.theme_row = self._make_settings_row("Theme", theme_label)
-        self.theme_row.setCursor(Qt.PointingHandCursor)
-        self.theme_row.mousePressEvent = lambda e: self._toggle_theme()
+        self.theme_row.tapped.connect(self._toggle_theme)
         content_layout.addWidget(self.theme_row)
 
         # Sleep row
         self.sleep_row = self._make_settings_row("Mise en veille", SLEEP_LABELS.get(self._sleep, f"{self._sleep} min"))
-        self.sleep_row.setCursor(Qt.PointingHandCursor)
-        self.sleep_row.mousePressEvent = lambda e: self._cycle_sleep()
+        self.sleep_row.tapped.connect(self._cycle_sleep)
         content_layout.addWidget(self.sleep_row)
 
         content_layout.addStretch()
@@ -453,9 +552,8 @@ class SettingsScreen(QWidget):
         self.stack.addWidget(page)
 
     def _make_settings_row(self, label_text, value_text, value_is_icon=False):
-        row = QFrame()
+        row = TappableFrame()
         row.setObjectName("settingsRow")
-        row.setCursor(Qt.PointingHandCursor)
         r_layout = QHBoxLayout(row)
         r_layout.setContentsMargins(14, 8, 14, 8)
 
@@ -550,10 +648,7 @@ class SettingsScreen(QWidget):
         layout.addWidget(self.wifi_pw_bar)
 
         # Scroll area for networks
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        QScroller.grabGesture(scroll.viewport(), QScroller.LeftMouseButtonGesture)
+        scroll = make_touch_scroll_area()
         self.wifi_list_widget = QWidget()
         self.wifi_list_layout = QVBoxLayout(self.wifi_list_widget)
         self.wifi_list_layout.setContentsMargins(0, 4, 0, 4)
@@ -590,9 +685,8 @@ class SettingsScreen(QWidget):
             return
 
         for net in networks:
-            item = QFrame()
+            item = TappableFrame()
             item.setObjectName("wifiItem")
-            item.setCursor(Qt.PointingHandCursor)
             item_layout = QHBoxLayout(item)
             item_layout.setContentsMargins(10, 6, 10, 6)
 
@@ -620,7 +714,7 @@ class SettingsScreen(QWidget):
 
             # Only make tappable if it's a real network (not the "non disponible" placeholder)
             if net["signal"] > 0 or net["in_use"]:
-                item.mousePressEvent = lambda e, n=net: self._on_wifi_selected(n)
+                item.tapped.connect(lambda n=net: self._on_wifi_selected(n))
 
             self.wifi_list_layout.addWidget(item)
 
@@ -830,9 +924,8 @@ class SearchScreen(QWidget):
         grid.setSpacing(12)
 
         for i, (label, mode_val, icon_char) in enumerate(TRANSPORT_MODES):
-            card = QFrame()
+            card = TappableFrame()
             card.setObjectName("modeBtn")
-            card.setCursor(Qt.PointingHandCursor)
             card.setMinimumHeight(100)
             card_layout = QVBoxLayout(card)
             card_layout.setAlignment(Qt.AlignCenter)
@@ -847,7 +940,7 @@ class SearchScreen(QWidget):
             text_lbl.setAlignment(Qt.AlignCenter)
             card_layout.addWidget(text_lbl)
 
-            card.mousePressEvent = lambda e, m=mode_val: self._on_mode_selected(m)
+            card.tapped.connect(lambda m=mode_val: self._on_mode_selected(m))
             grid.addWidget(card, i // 2, i % 2)
 
         layout.addWidget(grid_container)
@@ -892,10 +985,7 @@ class SearchScreen(QWidget):
         self.line_loading.setObjectName("loadingLabel")
         layout.addWidget(self.line_loading)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        QScroller.grabGesture(scroll.viewport(), QScroller.LeftMouseButtonGesture)
+        scroll = make_touch_scroll_area()
         self.line_results_widget = QWidget()
         self.line_results_layout = QVBoxLayout(self.line_results_widget)
         self.line_results_layout.setContentsMargins(0, 0, 0, 0)
@@ -933,9 +1023,8 @@ class SearchScreen(QWidget):
             return
 
         for line in lines:
-            btn_widget = QFrame()
+            btn_widget = TappableFrame()
             btn_widget.setObjectName("resultItem")
-            btn_widget.setCursor(Qt.PointingHandCursor)
             btn_layout = QHBoxLayout(btn_widget)
             btn_layout.setContentsMargins(10, 6, 10, 6)
 
@@ -954,7 +1043,7 @@ class SearchScreen(QWidget):
             name_label.setObjectName("resultTitle")
             btn_layout.addWidget(name_label, stretch=1)
 
-            btn_widget.mousePressEvent = lambda e, l=line: self._on_line_selected(l)
+            btn_widget.tapped.connect(lambda l=line: self._on_line_selected(l))
             self.line_results_layout.addWidget(btn_widget)
 
         self.line_results_layout.addStretch()
@@ -998,10 +1087,7 @@ class SearchScreen(QWidget):
         self.stop_loading.setObjectName("loadingLabel")
         layout.addWidget(self.stop_loading)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        QScroller.grabGesture(scroll.viewport(), QScroller.LeftMouseButtonGesture)
+        scroll = make_touch_scroll_area()
         self.stop_results_widget = QWidget()
         self.stop_results_layout = QVBoxLayout(self.stop_results_widget)
         self.stop_results_layout.setContentsMargins(0, 0, 0, 0)
@@ -1073,10 +1159,7 @@ class SearchScreen(QWidget):
         self.dir_loading.setObjectName("loadingLabel")
         layout.addWidget(self.dir_loading)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        QScroller.grabGesture(scroll.viewport(), QScroller.LeftMouseButtonGesture)
+        scroll = make_touch_scroll_area()
         self.dir_results_widget = QWidget()
         self.dir_results_layout = QVBoxLayout(self.dir_results_widget)
         self.dir_results_layout.setContentsMargins(0, 0, 0, 0)
@@ -1157,11 +1240,17 @@ class SearchScreen(QWidget):
 
     # ── Helpers ──
 
+    def show_error(self, msg: str):
+        """Show a worker error on the loading label of the current step."""
+        labels = {1: self.line_loading, 2: self.stop_loading, 3: self.dir_loading}
+        label = labels.get(self.stack.currentIndex())
+        if label:
+            label.setText(msg)
+
     def _make_result_item(self, title, subtitle, on_click):
         """Create a clickable result item frame."""
-        frame = QFrame()
+        frame = TappableFrame()
         frame.setObjectName("resultItem")
-        frame.setCursor(Qt.PointingHandCursor)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(2)
@@ -1175,7 +1264,7 @@ class SearchScreen(QWidget):
             s.setObjectName("resultSubtitle")
             layout.addWidget(s)
 
-        frame.mousePressEvent = lambda e: on_click(True)
+        frame.tapped.connect(lambda: on_click(True))
         return frame
 
     def _clear_layout(self, layout):
@@ -1248,7 +1337,6 @@ class VirtualKeyboard(QFrame):
                 btn.setMinimumHeight(38)
 
                 if key == "\u2423":  # space
-                    btn.setSizePolicy(btn.sizePolicy())
                     btn.setMinimumWidth(180)
                 elif key == "\u21e7":  # shift
                     btn.setMinimumWidth(56)
@@ -1258,7 +1346,12 @@ class VirtualKeyboard(QFrame):
                     btn.setMinimumWidth(72)
                     btn.setObjectName("kbKeyOk")
 
-                btn.clicked.connect(lambda checked, k=key: self._on_key(k))
+                # Look up the key at click time so shift can swap layouts
+                # without rewiring signal connections.
+                index = len(self._key_buttons)
+                btn.clicked.connect(
+                    lambda checked, i=index: self._on_key(self._key_buttons[i][0])
+                )
                 row_layout.addWidget(btn)
                 self._key_buttons.append((key, btn))
 
@@ -1299,14 +1392,8 @@ class VirtualKeyboard(QFrame):
     def _update_case(self):
         rows = self.ROWS_UPPER if self._shifted else self.ROWS_LOWER
         flat = [k for row in rows for k in row]
-        for i, (orig_key, btn) in enumerate(self._key_buttons):
+        for i, (_orig_key, btn) in enumerate(self._key_buttons):
             if i < len(flat):
                 new_key = flat[i]
                 btn.setText(self._display_text(new_key))
-                # Rebind click to the new key
-                try:
-                    btn.clicked.disconnect()
-                except TypeError:
-                    pass
-                btn.clicked.connect(lambda checked, k=new_key: self._on_key(k))
                 self._key_buttons[i] = (new_key, btn)

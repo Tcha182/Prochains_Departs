@@ -192,7 +192,7 @@ class LineSearchWorker(QObject):
                 where_parts.append(f'transportmode="{_sanitize_odsql(self.mode)}"')
             params = {
                 "select": "id_line,shortname_line,name_line,transportmode,colourweb_hexa,textcolourweb_hexa",
-                "limit": 20,
+                "limit": 100,  # API maximum; 20 truncated the mode-wide line list
             }
             if where_parts:
                 params["where"] = " AND ".join(where_parts)
@@ -205,10 +205,11 @@ class LineSearchWorker(QObject):
                 line_id = record.get("id_line", "")
                 results.append(LineAtStop(
                     line_id=line_id,
-                    line_name=record.get("shortname_line") or record.get("name_line", ""),
-                    mode=record.get("transportmode", ""),
-                    line_color=record.get("colourweb_hexa", "FFFFFF"),
-                    line_text_color=record.get("textcolourweb_hexa", "000000"),
+                    line_name=record.get("shortname_line") or record.get("name_line") or "",
+                    mode=record.get("transportmode") or "",
+                    # `or` fallbacks: the API returns null for some lines
+                    line_color=record.get("colourweb_hexa") or "FFFFFF",
+                    line_text_color=record.get("textcolourweb_hexa") or "000000",
                     route_id=f"IDFM:{line_id}",
                 ))
 
