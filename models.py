@@ -4,7 +4,7 @@ import json
 import os
 import re
 import unicodedata
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import List
 
 FAVOURITES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favourites.json")
@@ -64,6 +64,14 @@ class LineAtStop:
 class StopOnLine:
     stop_name: str
     stop_id: str = ""
+
+
+@dataclass
+class StopAreaMatch:
+    """A stop found by name search, with the lines serving it."""
+    stop_name: str
+    town: str = ""
+    routes: dict = field(default_factory=dict)  # {line_id: stop_id}
 
 
 def load_favourites() -> List[Favourite]:

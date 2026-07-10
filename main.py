@@ -4,6 +4,10 @@ Entry point: MainWindow with auto-refresh, countdown interpolation, and favourit
 """
 
 import glob
+import logging
+import logging.handlers
+import os
+import socket
 import sys
 import time
 import platform
@@ -18,7 +22,8 @@ from models import (
 )
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
-    ResolveAndProbeWorker, WiFiScanWorker, WiFiConnectWorker,
+    ResolveAndProbeWorker, StopAreaSearchWorker, LineDetailsWorker,
+    WiFiScanWorker, WiFiConnectWorker,
     start_worker,
 )
 from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard
@@ -29,6 +34,44 @@ WINDOW_HEIGHT = 480
 AUTO_REFRESH_MS = 1 * 60 * 1000  # 1 minute
 COUNTDOWN_MS = 1000  # 1 second
 KEYBOARD_HEIGHT = 220
+NOCTURNAL_START_HOUR = 2
+NOCTURNAL_END_HOUR = 5
+NOCTURNAL_SLEEP_MINUTES = 2  # idle time before the night screen kicks in
+HEARTBEAT_MS = 30 * 1000  # watchdog ping + nocturnal auto-wake check
+
+log = logging.getLogger("departs.main")
+
+
+def sd_notify(message: str) -> None:
+    """Send a message to the systemd notify socket, if one exists."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    try:
+        if addr.startswith("@"):  # abstract namespace socket
+            addr = "\0" + addr[1:]
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(message.encode(), addr)
+    except OSError:
+        pass
+
+
+def setup_logging() -> None:
+    """Log to a small rotating file next to the app, plus stderr."""
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
+    root = logging.getLogger("departs")
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except OSError:
+        pass  # read-only filesystem etc. — stderr still works
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
 
 
 class MainWindow(QMainWindow):
@@ -44,6 +87,7 @@ class MainWindow(QMainWindow):
         self._settings = load_settings()
         self._last_interaction_time = time.time()
         self._sleeping = False
+        self._nocturnal_sleep = False
 
         self._setup_ui()
         self._setup_timers()
@@ -74,6 +118,8 @@ class MainWindow(QMainWindow):
         self.search.line_search_requested.connect(self._on_line_search)
         self.search.stops_on_line_requested.connect(self._on_stops_on_line)
         self.search.resolve_and_probe_requested.connect(self._on_resolve_and_probe)
+        self.search.stop_area_search_requested.connect(self._on_stop_area_search)
+        self.search.line_details_requested.connect(self._on_line_details)
         self.stack.addWidget(self.search)
 
         # Settings screen (index 2)
@@ -116,6 +162,14 @@ class MainWindow(QMainWindow):
         self.countdown_timer.setInterval(COUNTDOWN_MS)
         self.countdown_timer.timeout.connect(self._on_countdown_tick)
         self.countdown_timer.start()
+
+        # Heartbeat: never stopped (unlike the timers above, which pause
+        # during sleep). Pings the systemd watchdog and ends a forced
+        # nocturnal sleep once the pause window is over.
+        self.heartbeat_timer = QTimer(self)
+        self.heartbeat_timer.setInterval(HEARTBEAT_MS)
+        self.heartbeat_timer.timeout.connect(self._on_heartbeat)
+        self.heartbeat_timer.start()
 
     def _detect_kiosk(self):
         """Go fullscreen and hide cursor on Raspberry Pi."""
@@ -232,10 +286,13 @@ class MainWindow(QMainWindow):
     def _on_departure_error(self, msg: str):
         self.home.set_updated_time(msg)
 
+    @staticmethod
+    def _is_nocturnal() -> bool:
+        return NOCTURNAL_START_HOUR <= datetime.now().hour < NOCTURNAL_END_HOUR
+
     def _auto_refresh(self):
         """Auto-refresh, but skip between 2am and 5am."""
-        hour = datetime.now().hour
-        if 2 <= hour < 5:
+        if self._is_nocturnal():
             self.home.set_next_refresh("Pause nocturne")
             return
         self._refresh_departures()
@@ -255,17 +312,40 @@ class MainWindow(QMainWindow):
             else:
                 self.home.set_next_refresh("")
 
-        # Sleep check
+        # Sleep check. During the nocturnal pause (no refreshes, stale data)
+        # the sleep screen always kicks in — even if sleep is disabled, and
+        # regardless of which screen is showing.
         sleep_delay = self._settings.sleep_delay_minutes
-        if sleep_delay > 0 and not self._sleeping and self.stack.currentIndex() == 0:
+        if self._is_nocturnal():
+            effective_delay = (min(sleep_delay, NOCTURNAL_SLEEP_MINUTES)
+                               if sleep_delay > 0 else NOCTURNAL_SLEEP_MINUTES)
+            home_only = False
+        else:
+            effective_delay = sleep_delay
+            home_only = True
+        if (effective_delay > 0 and not self._sleeping
+                and (not home_only or self.stack.currentIndex() == 0)):
             idle = time.time() - self._last_interaction_time
-            if idle > sleep_delay * 60:
+            if idle > effective_delay * 60:
                 self._enter_sleep()
+
+    def _on_heartbeat(self):
+        """Runs every 30s, including during sleep."""
+        sd_notify("WATCHDOG=1")
+        # Auto-wake from a forced nocturnal sleep: users who disabled sleep
+        # expect an always-on display, so don't require a tap at 5am.
+        if (self._sleeping and self._nocturnal_sleep
+                and not self._is_nocturnal()):
+            log.info("nocturnal pause over, waking display")
+            self._wake_up()
 
     # ── Sleep mode ───────────────────────────────────────────────────────────
 
     def _enter_sleep(self):
+        log.info("entering sleep (nocturnal=%s)", self._is_nocturnal())
         self._sleeping = True
+        self._nocturnal_sleep = (self._is_nocturnal()
+                                 and self._settings.sleep_delay_minutes == 0)
         self.refresh_timer.stop()
         self.countdown_timer.stop()
         # Clear stale departures so they aren't visible under the overlay
@@ -278,7 +358,9 @@ class MainWindow(QMainWindow):
         self._set_backlight(False)
 
     def _wake_up(self):
+        log.info("waking up")
         self._sleeping = False
+        self._nocturnal_sleep = False
         self._last_interaction_time = time.time()
         self.home.set_updated_time("Chargement...")
         self.sleep_overlay.hide()
@@ -337,6 +419,16 @@ class MainWindow(QMainWindow):
                             self.search.on_directions_results,
                             on_error=self.search.show_error)
 
+    def _on_stop_area_search(self, query: str, search_id: int):
+        self._launch_worker(StopAreaSearchWorker(query, search_id),
+                            self.search.on_stop_area_results,
+                            on_error=self.search.show_error)
+
+    def _on_line_details(self, line_ids: list):
+        self._launch_worker(LineDetailsWorker(line_ids),
+                            self.search.on_lines_at_stop_results,
+                            on_error=self.search.show_error)
+
     # ── Thread/worker cleanup ────────────────────────────────────────────────
 
     def _cleanup_worker(self, thread, worker):
@@ -347,6 +439,8 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    setup_logging()
+    log.info("app starting")
     app = QApplication(sys.argv)
 
     # Load icon font before creating any widgets
@@ -359,6 +453,7 @@ def main():
     window = MainWindow()
     window.show()
 
+    sd_notify("READY=1")
     sys.exit(app.exec_())
 
 
