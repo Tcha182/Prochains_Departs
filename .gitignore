@@ -4,4 +4,6 @@ __pycache__/
 favourites.json
 settings.json
 debug_output.txt
+app.log
+app.log.*
 nul
