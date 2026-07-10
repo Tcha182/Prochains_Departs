@@ -35,9 +35,11 @@ Gotchas learned the hard way:
   fake returning `{"Siri": {"ServiceDelivery": {"StopMonitoringDelivery":
   [{"MonitoredStopVisit": []}]}}}`, and `patch("main.load_favourites")`.
 - **`patch.object(w, "_on_line_search")` does NOT stop workers** — signal
-  connections hold the real bound method. Disconnect the SearchScreen signals
-  (`w.search.line_search_requested.disconnect()`, etc.) instead, or async empty
-  results will wipe fixture rows mid-test.
+  connections hold the real bound method. Disconnect all five SearchScreen
+  request signals (`line_search_requested`, `stops_on_line_requested`,
+  `resolve_and_probe_requested`, `stop_area_search_requested`,
+  `line_details_requested`) instead, or async empty results will wipe
+  fixture rows mid-test.
 - Taps must wait ~450ms after release: QScroller withholds the press and replays
   press+release on release.
 - Before asserting scroller state, wait until `QScroller.scroller(vp).state()`

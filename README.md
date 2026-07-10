@@ -6,17 +6,19 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 
 ## Features
 
-- **Multi-mode search**: Bus, Metro, Tramway, Train/RER with transport type icons
+- **Two search flows**: by stop name, or by transport type (Bus, Metro, Tramway, Train/RER) then line
 - **Direction filtering**: Choose which direction to monitor at each stop
-- **Live countdowns**: Updated every second from SIRI Lite real-time data
+- **Live countdowns**: Updated every second from SIRI Lite real-time data, computed against the server clock (immune to Pi clock drift)
 - **Favourites**: Saved locally with atomic writes (crash-safe)
-- **Auto-refresh**: Every 1 minute (pauses 2am-5am)
-- **Touch-optimised**: 800x480 layout with kinetic scrolling and virtual AZERTY keyboard
+- **Auto-refresh**: Every 1 minute, stops fetched in parallel (pauses 2am-5am)
+- **Touch-optimised**: 800x480 layout with kinetic scrolling, tap feedback, and virtual AZERTY keyboard with an accent/symbol layer
 - **Settings screen**: API token, WiFi configuration, theme, sleep delay
 - **WiFi configuration**: Scan and connect to networks via nmcli
 - **Dark/light theme**: Toggle between themes in settings
 - **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake
+- **Night screen**: During the 2am-5am refresh pause the display sleeps instead of showing stale data, and wakes automatically at 5am
 - **Kiosk mode**: Auto-fullscreen and hidden cursor on Raspberry Pi
+- **Field debugging**: Rotating log file (`app.log`) next to the app
 
 ## Architecture
 
@@ -111,7 +113,7 @@ The Pi is fully autonomous:
 - Timezone set to `Europe/Paris`
 - Auto-login on tty1, starts X11 with Openbox
 - App launches via systemd (`departure-display.service`, `After=multi-user.target`)
-- Restarts automatically if it crashes (`Restart=always`)
+- Restarts automatically if it crashes (`Restart=always`) or hangs (systemd watchdog, `WatchdogSec=120` — the app pings every 30s)
 - App updates daily at 3:30am from GitHub (only restarts if code changed)
 - OS security updates install daily, auto-reboot at 4am if needed
 - Hardware watchdog reboots the Pi if it freezes
@@ -126,6 +128,11 @@ To update manually:
 ssh pi@prochains-departs.local
 cd /home/pi/app && ./update.sh
 ```
+
+Note: the systemd unit is written once at setup time. To pick up unit changes
+(e.g. the watchdog) on an already-deployed Pi, re-run `setup-pi.sh` or edit
+`/etc/systemd/system/departure-display.service` by hand, then
+`sudo systemctl daemon-reload && sudo systemctl restart departure-display`.
 
 ## Project Structure
 

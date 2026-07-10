@@ -77,6 +77,7 @@ class TappableFrame(QFrame):
         if press_pos is not None:
             moved = (event.pos() - press_pos).manhattanLength()
             if moved <= QApplication.startDragDistance() and self.rect().contains(event.pos()):
+                self._flash()
                 self.tapped.emit()
         event.accept()
 
@@ -85,6 +86,22 @@ class TappableFrame(QFrame):
         if event.type() == QEvent.UngrabMouse:
             self._press_pos = None
         return super().event(event)
+
+    def _flash(self):
+        """Brief highlight so a tap visibly registered (presses are withheld
+        by the scroller, so there is no :pressed state to rely on)."""
+        self.setProperty("tapFlash", True)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        QTimer.singleShot(150, self._unflash)
+
+    def _unflash(self):
+        try:
+            self.setProperty("tapFlash", False)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        except RuntimeError:
+            pass  # widget was deleted (page rebuilt) before the timer fired
 
 
 # ─── DepartureCard ───────────────────────────────────────────────────────────
@@ -181,7 +198,11 @@ class DepartureCard(QFrame):
             return
         elapsed = time.time() - self.fetch_timestamp
         remaining = self.eta_seconds - elapsed
-        if remaining < -30:
+        if remaining < -60:
+            # Long gone — drop the row instead of keeping "Parti" around
+            # until the next refresh rebuilds the list.
+            self.hide()
+        elif remaining < -30:
             self._render_countdown("Parti", "countdown_departed")
         elif remaining < 60:
             self._render_countdown("< 1 min", "countdown_imminent")
@@ -443,12 +464,22 @@ class SleepOverlay(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Plain QWidgets don't paint stylesheet backgrounds without this —
+        # the screen underneath would show through around the labels.
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("background-color: black;")
         self.setCursor(Qt.BlankCursor)
         self.hide()
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
+        layout.setSpacing(16)
+
+        moon = QLabel(Icons.MOON)
+        moon.setFont(icon_font(56))
+        moon.setAlignment(Qt.AlignCenter)
+        moon.setStyleSheet("color: #30363d; background-color: black;")
+        layout.addWidget(moon)
 
         hint = QLabel("Appuyez pour activer")
         hint.setAlignment(Qt.AlignCenter)
@@ -844,7 +875,11 @@ class SettingsScreen(QWidget):
 # ─── SearchScreen ────────────────────────────────────────────────────────────
 
 class SearchScreen(QWidget):
-    """4-step flow: transport type -> line -> stop -> direction."""
+    """Two flows to add a favourite:
+
+    line-first:  transport type (0) -> line (1) -> stop (2) -> direction (3)
+    stop-first:  stop name search (0) -> stops (4) -> lines at stop (5) -> direction (3)
+    """
 
     favourite_added = pyqtSignal(object)  # emits Favourite
     back_to_home = pyqtSignal()
@@ -853,6 +888,11 @@ class SearchScreen(QWidget):
     line_search_requested = pyqtSignal(str, str)          # query, mode
     stops_on_line_requested = pyqtSignal(str)              # route_id
     resolve_and_probe_requested = pyqtSignal(str, str)     # stop_id, line_id
+    stop_area_search_requested = pyqtSignal(str, int)      # query, search_id
+    line_details_requested = pyqtSignal(list)              # [line_id, ...]
+
+    # Fallback back-navigation when a page was reached without _navigate()
+    _BACK_FALLBACK = {1: 0, 2: 1, 3: 2, 4: 0, 5: 4}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -860,13 +900,20 @@ class SearchScreen(QWidget):
         self.selected_line = None   # LineAtStop
         self.selected_stop = None   # StopOnLine
         self._all_stops = []        # full stop list for filtering
+        self._selected_stop_area = None  # StopAreaMatch (stop-first flow)
         self._resolved_stop_area_id = ""
         self._resolved_stop_name = ""
+        self._nav_history = []      # page indexes for the back button
         self._debounce_timer = QTimer()
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(600)
         self._debounce_timer.timeout.connect(self._do_search)
         self._search_id = 0  # incremented on each search to ignore stale results
+        self._stop_debounce_timer = QTimer()
+        self._stop_debounce_timer.setSingleShot(True)
+        self._stop_debounce_timer.setInterval(600)
+        self._stop_debounce_timer.timeout.connect(self._do_stop_search)
+        self._stop_search_id = 0
         self._setup_ui()
 
     def _setup_ui(self):
@@ -877,10 +924,18 @@ class SearchScreen(QWidget):
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
 
-        self._build_mode_page()           # page 0
-        self._build_line_search_page()    # page 1
-        self._build_stop_selection_page() # page 2
-        self._build_direction_page()      # page 3
+        self._build_mode_page()             # page 0
+        self._build_line_search_page()      # page 1
+        self._build_stop_selection_page()   # page 2
+        self._build_direction_page()        # page 3
+        self._build_stop_search_page()      # page 4
+        self._build_lines_at_stop_page()    # page 5
+
+    def _navigate(self, index: int):
+        if index == self.stack.currentIndex():
+            return
+        self._nav_history.append(self.stack.currentIndex())
+        self.stack.setCurrentIndex(index)
 
     def _make_header(self, title_text, parent_layout):
         header = QFrame()
@@ -905,8 +960,10 @@ class SearchScreen(QWidget):
         idx = self.stack.currentIndex()
         if idx == 0:
             self.back_to_home.emit()
+        elif self._nav_history:
+            self.stack.setCurrentIndex(self._nav_history.pop())
         else:
-            self.stack.setCurrentIndex(idx - 1)
+            self.stack.setCurrentIndex(self._BACK_FALLBACK.get(idx, 0))
 
     # ── Step 1: Transport type ──
 
@@ -916,17 +973,33 @@ class SearchScreen(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._make_header("Type de transport", layout)
+        self._make_header("Ajouter un arret", layout)
+
+        # Stop-first flow: search a stop by name
+        input_container = QWidget()
+        input_layout = QHBoxLayout(input_container)
+        input_layout.setContentsMargins(8, 8, 8, 0)
+        self.stop_search_input = QLineEdit()
+        self.stop_search_input.setObjectName("searchInput")
+        self.stop_search_input.setPlaceholderText("Chercher un arret par nom...")
+        self.stop_search_input.textChanged.connect(self._on_stop_search_text_changed)
+        input_layout.addWidget(self.stop_search_input)
+        layout.addWidget(input_container)
+
+        # Line-first flow: pick a transport type
+        mode_title = QLabel("ou choisir une ligne")
+        mode_title.setObjectName("stepTitle")
+        layout.addWidget(mode_title)
 
         grid_container = QWidget()
         grid = QGridLayout(grid_container)
-        grid.setContentsMargins(16, 24, 16, 16)
+        grid.setContentsMargins(16, 4, 16, 16)
         grid.setSpacing(12)
 
         for i, (label, mode_val, icon_char) in enumerate(TRANSPORT_MODES):
             card = TappableFrame()
             card.setObjectName("modeBtn")
-            card.setMinimumHeight(100)
+            card.setMinimumHeight(90)
             card_layout = QVBoxLayout(card)
             card_layout.setAlignment(Qt.AlignCenter)
             card_layout.setSpacing(4)
@@ -953,7 +1026,7 @@ class SearchScreen(QWidget):
         self.search_input.clear()
         self._clear_layout(self.line_results_layout)
         self.line_step_title.setText(TRANSPORT_MODE_LABELS.get(mode, mode))
-        self.stack.setCurrentIndex(1)
+        self._navigate(1)
         # Load all lines for this mode immediately
         self.line_search_requested.emit("", mode)
 
@@ -1023,30 +1096,35 @@ class SearchScreen(QWidget):
             return
 
         for line in lines:
-            btn_widget = TappableFrame()
-            btn_widget.setObjectName("resultItem")
-            btn_layout = QHBoxLayout(btn_widget)
-            btn_layout.setContentsMargins(10, 6, 10, 6)
-
-            badge = QLabel(line.line_name)
-            badge.setFixedWidth(60)
-            badge.setAlignment(Qt.AlignCenter)
-            bg = line.line_color or "FFFFFF"
-            fg = line.line_text_color or "000000"
-            badge.setStyleSheet(
-                f"background-color: #{bg}; color: #{fg}; "
-                f"border-radius: 6px; padding: 4px 8px; font-weight: bold; font-size: 14px;"
-            )
-            btn_layout.addWidget(badge)
-
-            name_label = QLabel(f"{line.line_name} - {line.mode}" if line.mode else line.line_name)
-            name_label.setObjectName("resultTitle")
-            btn_layout.addWidget(name_label, stretch=1)
-
-            btn_widget.tapped.connect(lambda l=line: self._on_line_selected(l))
-            self.line_results_layout.addWidget(btn_widget)
+            self.line_results_layout.addWidget(
+                self._make_line_row(line, self._on_line_selected))
 
         self.line_results_layout.addStretch()
+
+    def _make_line_row(self, line: LineAtStop, on_tap):
+        """Result row with a coloured line badge."""
+        row = TappableFrame()
+        row.setObjectName("resultItem")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(10, 6, 10, 6)
+
+        badge = QLabel(line.line_name)
+        badge.setFixedWidth(60)
+        badge.setAlignment(Qt.AlignCenter)
+        bg = line.line_color or "FFFFFF"
+        fg = line.line_text_color or "000000"
+        badge.setStyleSheet(
+            f"background-color: #{bg}; color: #{fg}; "
+            f"border-radius: 6px; padding: 4px 8px; font-weight: bold; font-size: 14px;"
+        )
+        row_layout.addWidget(badge)
+
+        name_label = QLabel(f"{line.line_name} - {line.mode}" if line.mode else line.line_name)
+        name_label.setObjectName("resultTitle")
+        row_layout.addWidget(name_label, stretch=1)
+
+        row.tapped.connect(lambda l=line: on_tap(l))
+        return row
 
     def _on_line_selected(self, line: LineAtStop):
         self.selected_line = line
@@ -1056,7 +1134,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.stop_results_layout)
         self.stop_step_title.setText(f"Arrets - {line.line_name}")
         self.stops_on_line_requested.emit(line.route_id)
-        self.stack.setCurrentIndex(2)
+        self._navigate(2)
 
     # ── Step 3: Stop selection ──
 
@@ -1130,6 +1208,11 @@ class SearchScreen(QWidget):
 
     def _on_stop_selected(self, stop: StopOnLine):
         self.selected_stop = stop
+        self._start_direction_probe()
+
+    def _start_direction_probe(self):
+        """Shared final step of both flows: resolve the stop and probe directions."""
+        stop = self.selected_stop
         self._resolved_stop_area_id = ""
         self._resolved_stop_name = ""
         self.dir_loading.setText("Chargement des directions...")
@@ -1139,7 +1222,7 @@ class SearchScreen(QWidget):
             if self.selected_line else stop.stop_name
         )
         self.resolve_and_probe_requested.emit(stop.stop_id, self.selected_line.line_id)
-        self.stack.setCurrentIndex(3)
+        self._navigate(3)
 
     # ── Step 4: Direction selection ──
 
@@ -1222,6 +1305,134 @@ class SearchScreen(QWidget):
 
         self.dir_results_layout.addStretch()
 
+    # ── Stop-first flow: pages 4 and 5 ──
+
+    def _build_stop_search_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._make_header("Choisir un arret", layout)
+
+        self.stop_search_loading = QLabel("")
+        self.stop_search_loading.setObjectName("loadingLabel")
+        layout.addWidget(self.stop_search_loading)
+
+        scroll = make_touch_scroll_area()
+        self.stop_search_results_widget = QWidget()
+        self.stop_search_results_layout = QVBoxLayout(self.stop_search_results_widget)
+        self.stop_search_results_layout.setContentsMargins(0, 0, 0, 0)
+        self.stop_search_results_layout.setSpacing(2)
+        self.stop_search_results_layout.addStretch()
+        scroll.setWidget(self.stop_search_results_widget)
+        layout.addWidget(scroll, stretch=1)
+
+        self.stack.addWidget(page)
+
+    def _build_lines_at_stop_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._make_header("Choisir une ligne", layout)
+
+        self.lines_at_stop_title = QLabel("")
+        self.lines_at_stop_title.setObjectName("stepTitle")
+        layout.addWidget(self.lines_at_stop_title)
+
+        self.lines_at_stop_loading = QLabel("")
+        self.lines_at_stop_loading.setObjectName("loadingLabel")
+        layout.addWidget(self.lines_at_stop_loading)
+
+        scroll = make_touch_scroll_area()
+        self.lines_at_stop_widget = QWidget()
+        self.lines_at_stop_layout = QVBoxLayout(self.lines_at_stop_widget)
+        self.lines_at_stop_layout.setContentsMargins(0, 0, 0, 0)
+        self.lines_at_stop_layout.setSpacing(2)
+        self.lines_at_stop_layout.addStretch()
+        scroll.setWidget(self.lines_at_stop_widget)
+        layout.addWidget(scroll, stretch=1)
+
+        self.stack.addWidget(page)
+
+    def _on_stop_search_text_changed(self, text):
+        self._stop_debounce_timer.stop()
+        if len(text.strip()) >= 2:
+            self._stop_debounce_timer.start()
+
+    def _do_stop_search(self):
+        query = self.stop_search_input.text().strip()
+        if len(query) < 2:
+            return
+        self._stop_search_id += 1
+        self.stop_search_loading.setText("Recherche...")
+        self._clear_layout(self.stop_search_results_layout)
+        self._navigate(4)
+        self.stop_area_search_requested.emit(query, self._stop_search_id)
+
+    def on_stop_area_results(self, matches: list, search_id: int = 0):
+        """Called when stop-name search results arrive."""
+        if search_id and search_id != self._stop_search_id:
+            return
+        self.stop_search_loading.setText("")
+        self._clear_layout(self.stop_search_results_layout)
+
+        if not matches:
+            lbl = QLabel("Aucun arret trouve")
+            lbl.setObjectName("noDepartureLabel")
+            lbl.setAlignment(Qt.AlignCenter)
+            self.stop_search_results_layout.addWidget(lbl)
+            self.stop_search_results_layout.addStretch()
+            return
+
+        for match in matches:
+            item = self._make_result_item(
+                match.stop_name, match.town,
+                lambda checked, m=match: self._on_stop_area_selected(m),
+            )
+            self.stop_search_results_layout.addWidget(item)
+        self.stop_search_results_layout.addStretch()
+
+    def _on_stop_area_selected(self, match):
+        self._selected_stop_area = match
+        self.lines_at_stop_title.setText(
+            f"{match.stop_name} ({match.town})" if match.town else match.stop_name)
+        self.lines_at_stop_loading.setText("Chargement des lignes...")
+        self._clear_layout(self.lines_at_stop_layout)
+        self._navigate(5)
+        self.line_details_requested.emit(list(match.routes.keys()))
+
+    def on_lines_at_stop_results(self, lines: list):
+        """Called when line details for the selected stop arrive."""
+        self.lines_at_stop_loading.setText("")
+        self._clear_layout(self.lines_at_stop_layout)
+
+        if not lines:
+            lbl = QLabel("Aucune ligne trouvee")
+            lbl.setObjectName("noDepartureLabel")
+            lbl.setAlignment(Qt.AlignCenter)
+            self.lines_at_stop_layout.addWidget(lbl)
+            self.lines_at_stop_layout.addStretch()
+            return
+
+        for line in lines:
+            self.lines_at_stop_layout.addWidget(
+                self._make_line_row(line, self._on_line_at_stop_selected))
+        self.lines_at_stop_layout.addStretch()
+
+    def _on_line_at_stop_selected(self, line: LineAtStop):
+        area = self._selected_stop_area
+        if area is None:
+            return
+        self.selected_line = line
+        self.selected_stop = StopOnLine(
+            stop_name=area.stop_name,
+            stop_id=area.routes.get(line.line_id, ""),
+        )
+        self._start_direction_probe()
+
     def _on_direction_selected(self, direction_ref: str, destination_name: str = ""):
         if not self.selected_line or not self._resolved_stop_area_id:
             return
@@ -1242,7 +1453,13 @@ class SearchScreen(QWidget):
 
     def show_error(self, msg: str):
         """Show a worker error on the loading label of the current step."""
-        labels = {1: self.line_loading, 2: self.stop_loading, 3: self.dir_loading}
+        labels = {
+            1: self.line_loading,
+            2: self.stop_loading,
+            3: self.dir_loading,
+            4: self.stop_search_loading,
+            5: self.lines_at_stop_loading,
+        }
         label = labels.get(self.stack.currentIndex())
         if label:
             label.setText(msg)
@@ -1280,37 +1497,67 @@ class SearchScreen(QWidget):
         self.selected_line = None
         self.selected_stop = None
         self._all_stops = []
+        self._selected_stop_area = None
         self._resolved_stop_area_id = ""
         self._resolved_stop_name = ""
+        self._nav_history.clear()
+        self._debounce_timer.stop()
+        self._stop_debounce_timer.stop()
         self.search_input.clear()
         self.stop_filter_input.clear()
+        self.stop_search_input.clear()
         self._clear_layout(self.line_results_layout)
         self._clear_layout(self.stop_results_layout)
         self._clear_layout(self.dir_results_layout)
+        self._clear_layout(self.stop_search_results_layout)
+        self._clear_layout(self.lines_at_stop_layout)
         self.line_loading.setText("")
         self.stop_loading.setText("")
         self.dir_loading.setText("")
+        self.stop_search_loading.setText("")
+        self.lines_at_stop_loading.setText("")
         self.stack.setCurrentIndex(0)
 
 
 # ─── Virtual Keyboard ──────────────────────────────────────────────────────
 
 class VirtualKeyboard(QFrame):
-    """On-screen AZERTY keyboard for touchscreen input."""
+    """On-screen AZERTY keyboard for touchscreen input.
+
+    Two layers (letters / accents+symbols), each with a shift variant.
+    All layouts share the same shape so buttons are relabelled in place.
+    """
+
+    KEY_ACCENTS = "\u00e9\u00e0"  # layer-toggle label: "\u00e9\u00e0"
+    KEY_LETTERS = "abc"
 
     ROWS_LOWER = [
         list("1234567890"),
         list("azertyuiop"),
         list("qsdfghjklm"),
         ["\u21e7", "w", "x", "c", "v", "b", "n", "\u232b"],
-        ["\u2423", "@", "-", ".", "#", "&", "OK"],
+        ["\u2423", "@", "-", ".", "#", KEY_ACCENTS, "OK"],
     ]
     ROWS_UPPER = [
         list("!\"#$%&*()_"),
         list("AZERTYUIOP"),
         list("QSDFGHJKLM"),
         ["\u21e7", "W", "X", "C", "V", "B", "N", "\u232b"],
-        ["\u2423", "@", "-", ".", "#", "&", "OK"],
+        ["\u2423", "@", "-", ".", "#", KEY_ACCENTS, "OK"],
+    ]
+    ROWS_ACCENT = [
+        list("\u00e9\u00e8\u00ea\u00eb\u00e0\u00e2\u00e7\u00f9\u00fb\u00fc"),  # \u00e9 \u00e8 \u00ea \u00eb \u00e0 \u00e2 \u00e7 \u00f9 \u00fb \u00fc
+        list("\u00ee\u00ef\u00f4\u00f6\u0153!?'\"&"),                          # \u00ee \u00ef \u00f4 \u00f6 \u0153 ! ? ' " &
+        list("()[]{}<>%="),
+        ["\u21e7", "_", "/", ":", ";", "*", "~", "\u232b"],
+        ["\u2423", "@", "-", ".", "#", KEY_LETTERS, "OK"],
+    ]
+    ROWS_ACCENT_UPPER = [
+        list("\u00c9\u00c8\u00ca\u00cb\u00c0\u00c2\u00c7\u00d9\u00db\u00dc"),  # \u00c9 \u00c8 \u00ca \u00cb \u00c0 \u00c2 \u00c7 \u00d9 \u00db \u00dc
+        list("\u00ce\u00cf\u00d4\u00d6\u0152!?'\"&"),                          # \u00ce \u00cf \u00d4 \u00d6 \u0152 ! ? ' " &
+        list("()[]{}<>%="),
+        ["\u21e7", "_", "/", ":", ";", "*", "~", "\u232b"],
+        ["\u2423", "@", "-", ".", "#", KEY_LETTERS, "OK"],
     ]
 
     def __init__(self, parent=None):
@@ -1318,6 +1565,7 @@ class VirtualKeyboard(QFrame):
         self.setObjectName("virtualKeyboard")
         self._target = None
         self._shifted = False
+        self._accent = False
         self._key_buttons = []
         self._setup_ui()
         self.hide()
@@ -1368,6 +1616,11 @@ class VirtualKeyboard(QFrame):
 
     def set_target(self, widget):
         self._target = widget
+        # Fresh field, fresh layer
+        if self._accent or self._shifted:
+            self._accent = False
+            self._shifted = False
+            self._update_layout()
 
     def _on_key(self, key):
         if not self._target:
@@ -1375,23 +1628,35 @@ class VirtualKeyboard(QFrame):
 
         if key == "\u21e7":  # shift
             self._shifted = not self._shifted
-            self._update_case()
+            self._update_layout()
         elif key == "\u232b":  # backspace
             self._target.backspace()
         elif key == "OK":
             self.hide()
         elif key == "\u2423":  # space
             self._target.insert(" ")
+        elif key == self.KEY_ACCENTS:
+            self._accent = True
+            self._shifted = False
+            self._update_layout()
+        elif key == self.KEY_LETTERS:
+            self._accent = False
+            self._shifted = False
+            self._update_layout()
         else:
             char = key.upper() if self._shifted and key.isalpha() else key
             self._target.insert(char)
             if self._shifted:
                 self._shifted = False
-                self._update_case()
+                self._update_layout()
 
-    def _update_case(self):
-        rows = self.ROWS_UPPER if self._shifted else self.ROWS_LOWER
-        flat = [k for row in rows for k in row]
+    def _current_rows(self):
+        if self._accent:
+            return self.ROWS_ACCENT_UPPER if self._shifted else self.ROWS_ACCENT
+        return self.ROWS_UPPER if self._shifted else self.ROWS_LOWER
+
+    def _update_layout(self):
+        flat = [k for row in self._current_rows() for k in row]
         for i, (_orig_key, btn) in enumerate(self._key_buttons):
             if i < len(flat):
                 new_key = flat[i]

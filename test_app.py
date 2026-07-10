@@ -26,7 +26,8 @@ from models import (
 )
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
-    ResolveAndProbeWorker, start_worker,
+    ResolveAndProbeWorker, StopAreaSearchWorker, LineDetailsWorker,
+    start_worker,
 )
 from widgets import DepartureCard, FavouriteGroup, HomeScreen, SearchScreen
 from styles import DARK_THEME
@@ -1556,3 +1557,417 @@ class TestEdgeCases:
         home.populate([fav], {"1_L1_": [dep]})
         _app.processEvents()
         assert len(home.groups) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. NEW FEATURE TESTS (clock drift, stop-first search, keyboard, sleep)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestServerTimestampEta:
+    """ETAs must be computed against the server clock, not the Pi's."""
+
+    def test_eta_uses_response_timestamp(self):
+        worker = DepartureWorker([])
+        expected = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        data = make_siri_response([{"expected_time": expected}])
+        # Server says "now" is 5 minutes in the future of local time
+        server_now = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        data["Siri"]["ServiceDelivery"]["ResponseTimestamp"] = server_now
+        deps = worker._parse_departures(data, time.time())
+        # 10min - 5min = ~5min relative to the server, despite local clock
+        assert 290 <= deps[0].eta_seconds <= 310
+
+    def test_eta_falls_back_to_local_clock(self):
+        worker = DepartureWorker([])
+        expected = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        data = make_siri_response([{"expected_time": expected}])  # no ResponseTimestamp
+        deps = worker._parse_departures(data, time.time())
+        assert 290 <= deps[0].eta_seconds <= 310
+
+
+class TestApiKeyError:
+    @patch("api.requests.get")
+    def test_401_shows_friendly_message(self, mock_get):
+        import requests as _requests
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        error = _requests.HTTPError(response=mock_resp)
+        mock_resp.raise_for_status.side_effect = error
+        mock_get.return_value = mock_resp
+
+        fav = Favourite("50980", "Test", "C02000", "259")
+        worker = DepartureWorker([fav])
+        errors = []
+        worker.error.connect(errors.append)
+        worker.run()
+        assert errors == ["Cle API invalide - voir Parametres"]
+
+    @patch("api.requests.get")
+    def test_other_http_error_keeps_generic_message(self, mock_get):
+        import requests as _requests
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.raise_for_status.side_effect = _requests.HTTPError(response=mock_resp)
+        mock_get.return_value = mock_resp
+
+        fav = Favourite("50980", "Test", "C02000", "259")
+        worker = DepartureWorker([fav])
+        errors = []
+        worker.error.connect(errors.append)
+        worker.run()
+        assert len(errors) == 1
+        assert errors[0].startswith("Erreur")
+
+
+class TestParallelDepartureFetch:
+    @patch("api.requests.get")
+    def test_multiple_groups_all_fetched(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = make_siri_response([])
+        mock_get.return_value = mock_resp
+
+        favs = [
+            Favourite("50980", "Stop A", "C02000", "259", direction="1"),
+            Favourite("50981", "Stop B", "C02001", "260", direction="1"),
+            Favourite("50982", "Stop C", "C02002", "261", direction="1"),
+        ]
+        worker = DepartureWorker(favs)
+        results = {}
+        worker.finished.connect(results.update)
+        worker.run()
+        assert mock_get.call_count == 3
+        assert len(results) == 3
+
+
+class TestStopAreaSearchWorker:
+    @patch("api.requests.get")
+    def test_groups_by_stop_and_town(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [
+                {"stop_name": "Mairie", "id": "IDFM:C01111", "stop_id": "IDFM:1", "nom_commune": "Pantin"},
+                {"stop_name": "Mairie", "id": "IDFM:C02222", "stop_id": "IDFM:2", "nom_commune": "Pantin"},
+                {"stop_name": "Mairie", "id": "IDFM:C01111", "stop_id": "IDFM:3", "nom_commune": "Clamart"},
+            ]
+        }
+        mock_get.return_value = mock_resp
+
+        worker = StopAreaSearchWorker("mairie", 7)
+        results = []
+        ids = []
+        worker.finished.connect(lambda r, sid: (results.extend(r), ids.append(sid)))
+        worker.run()
+
+        assert ids == [7]
+        assert len(results) == 2  # Pantin and Clamart grouped separately
+        clamart = next(m for m in results if m.town == "Clamart")
+        pantin = next(m for m in results if m.town == "Pantin")
+        assert pantin.routes == {"C01111": "IDFM:1", "C02222": "IDFM:2"}
+        assert clamart.routes == {"C01111": "IDFM:3"}
+
+    @patch("api.requests.get")
+    def test_missing_commune_field_tolerated(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [{"stop_name": "Gare", "id": "IDFM:C09999", "stop_id": "IDFM:9"}]
+        }
+        mock_get.return_value = mock_resp
+
+        worker = StopAreaSearchWorker("gare")
+        results = []
+        worker.finished.connect(lambda r, sid: results.extend(r))
+        worker.run()
+        assert len(results) == 1
+        assert results[0].town == ""
+
+    @patch("api.requests.get")
+    def test_http_error_emits_and_finishes_empty(self, mock_get):
+        import requests as _requests
+        mock_get.side_effect = _requests.ConnectionError("down")
+        worker = StopAreaSearchWorker("x", 3)
+        results, errors = [], []
+        worker.finished.connect(lambda r, sid: results.append((list(r), sid)))
+        worker.error.connect(errors.append)
+        worker.run()
+        assert results == [([], 3)]
+        assert len(errors) == 1
+
+
+class TestLineDetailsWorker:
+    @patch("api.requests.get")
+    def test_builds_or_where_clause(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"results": []}
+        mock_get.return_value = mock_resp
+
+        worker = LineDetailsWorker(["C01111", "C02222"])
+        worker.finished.connect(lambda r: None)
+        worker.run()
+        where = mock_get.call_args.kwargs.get("params", mock_get.call_args[1]["params"])["where"]
+        assert where == 'id_line="C01111" OR id_line="C02222"'
+
+    @patch("api.requests.get")
+    def test_empty_ids_skip_network(self, mock_get):
+        worker = LineDetailsWorker([])
+        results = []
+        worker.finished.connect(lambda r: results.append(list(r)))
+        worker.run()
+        assert results == [[]]
+        mock_get.assert_not_called()
+
+    @patch("api.requests.get")
+    def test_parses_and_sorts_lines(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "results": [
+                {"id_line": "C2", "shortname_line": "10", "transportmode": "bus",
+                 "colourweb_hexa": None, "textcolourweb_hexa": None},
+                {"id_line": "C1", "shortname_line": "2", "transportmode": "bus",
+                 "colourweb_hexa": "FF0000", "textcolourweb_hexa": "FFFFFF"},
+            ]
+        }
+        mock_get.return_value = mock_resp
+
+        worker = LineDetailsWorker(["C1", "C2"])
+        results = []
+        worker.finished.connect(lambda r: results.extend(r))
+        worker.run()
+        assert [l.line_name for l in results] == ["2", "10"]  # natural sort
+        assert results[1].line_color == "FFFFFF"  # None coalesced
+
+
+class TestStopFirstSearchFlow:
+    def _screen_with_matches(self):
+        from models import StopAreaMatch
+        screen = SearchScreen()
+        matches = [
+            StopAreaMatch("Mairie de Pantin", "Pantin", {"C01111": "IDFM:1", "C02222": "IDFM:2"}),
+        ]
+        screen.stack.setCurrentIndex(4)
+        screen.on_stop_area_results(matches, 0)
+        return screen, matches
+
+    def test_stop_results_displayed(self):
+        screen, _ = self._screen_with_matches()
+        widgets = [screen.stop_search_results_layout.itemAt(i).widget()
+                   for i in range(screen.stop_search_results_layout.count())]
+        assert any(w is not None for w in widgets)
+
+    def test_stop_selection_requests_line_details(self):
+        screen, matches = self._screen_with_matches()
+        requested = []
+        screen.line_details_requested.connect(requested.append)
+        screen._on_stop_area_selected(matches[0])
+        assert screen.stack.currentIndex() == 5
+        assert sorted(requested[0]) == ["C01111", "C02222"]
+
+    def test_line_at_stop_selection_probes_directions(self):
+        screen, matches = self._screen_with_matches()
+        screen._on_stop_area_selected(matches[0])
+        probes = []
+        screen.resolve_and_probe_requested.connect(lambda s, l: probes.append((s, l)))
+        line = LineAtStop("C01111", "170", "bus", "FF0000", "FFFFFF", "IDFM:C01111")
+        screen._on_line_at_stop_selected(line)
+        assert probes == [("IDFM:1", "C01111")]
+        assert screen.stack.currentIndex() == 3
+        assert screen.selected_stop.stop_name == "Mairie de Pantin"
+
+    def test_back_follows_navigation_history(self):
+        screen, matches = self._screen_with_matches()
+        screen.stack.setCurrentIndex(0)
+        screen._nav_history.clear()
+        screen._navigate(4)
+        screen._on_stop_area_selected(matches[0])   # -> 5
+        line = LineAtStop("C01111", "170", "bus")
+        screen._on_line_at_stop_selected(line)      # -> 3
+        screen._go_back()
+        assert screen.stack.currentIndex() == 5
+        screen._go_back()
+        assert screen.stack.currentIndex() == 4
+        screen._go_back()
+        assert screen.stack.currentIndex() == 0
+
+    def test_stale_stop_results_ignored(self):
+        from models import StopAreaMatch
+        screen = SearchScreen()
+        screen._stop_search_id = 5
+        screen.on_stop_area_results([StopAreaMatch("Old", "X")], 4)  # stale
+        widgets = [screen.stop_search_results_layout.itemAt(i).widget()
+                   for i in range(screen.stop_search_results_layout.count())]
+        assert all(w is None for w in widgets)  # only the stretch
+
+    def test_reset_clears_stop_first_state(self):
+        screen, matches = self._screen_with_matches()
+        screen._on_stop_area_selected(matches[0])
+        screen.stop_search_input.setText("mairie")
+        screen.reset()
+        assert screen.stack.currentIndex() == 0
+        assert screen._selected_stop_area is None
+        assert screen._nav_history == []
+        assert screen.stop_search_input.text() == ""
+
+
+class TestKeyboardAccents:
+    def _kb_with_target(self):
+        from widgets import VirtualKeyboard
+        from PyQt5.QtWidgets import QLineEdit
+        kb = VirtualKeyboard()
+        target = QLineEdit()
+        kb.set_target(target)
+        return kb, target
+
+    def test_accent_layer_toggle(self):
+        kb, target = self._kb_with_target()
+        kb._on_key(kb.KEY_ACCENTS)
+        assert kb._accent is True
+        keys = [k for k, b in kb._key_buttons]
+        assert "é" in keys and "ç" in keys
+        kb._on_key("é")
+        assert target.text() == "é"
+        kb._on_key(kb.KEY_LETTERS)
+        assert kb._accent is False
+        keys = [k for k, b in kb._key_buttons]
+        assert "a" in keys
+
+    def test_shift_in_accent_layer(self):
+        kb, target = self._kb_with_target()
+        kb._on_key(kb.KEY_ACCENTS)
+        kb._on_key("⇧")  # shift
+        keys = [k for k, b in kb._key_buttons]
+        assert "É" in keys
+        kb._on_key("É")
+        assert target.text() == "É"
+        assert kb._shifted is False  # auto-released after one char
+
+    def test_set_target_resets_layer(self):
+        kb, target = self._kb_with_target()
+        kb._on_key(kb.KEY_ACCENTS)
+        from PyQt5.QtWidgets import QLineEdit
+        kb.set_target(QLineEdit())
+        assert kb._accent is False
+
+    def test_all_layouts_have_same_shape(self):
+        from widgets import VirtualKeyboard
+        shapes = {tuple(len(r) for r in rows) for rows in (
+            VirtualKeyboard.ROWS_LOWER, VirtualKeyboard.ROWS_UPPER,
+            VirtualKeyboard.ROWS_ACCENT, VirtualKeyboard.ROWS_ACCENT_UPPER)}
+        assert len(shapes) == 1
+
+
+class TestDepartedCardHides:
+    def test_card_hides_when_long_departed(self):
+        dep = Departure("259", "X", "Test", "",
+                        fetch_timestamp=time.time() - 120, eta_seconds=1.0)
+        card = DepartureCard(dep)
+        card.show()
+        card.update_countdown()
+        assert card.isHidden()
+
+    def test_card_shows_parti_within_grace_window(self):
+        dep = Departure("259", "X", "Test", "",
+                        fetch_timestamp=time.time() - 45, eta_seconds=1.0)
+        card = DepartureCard(dep)
+        card.show()
+        card.update_countdown()
+        assert not card.isHidden()
+        assert card.countdown_label.text() == "Parti"
+
+
+class TestNocturnalSleep:
+    @patch("main.load_favourites", return_value=[])
+    def test_forced_sleep_during_night(self, mock_load):
+        from main import MainWindow
+        w = MainWindow()
+        w._settings.sleep_delay_minutes = 0  # sleep disabled by user
+        w._last_interaction_time = time.time() - 10 * 60
+        with patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=3)
+            with patch.object(w, "_enter_sleep") as mock_sleep:
+                w._on_countdown_tick()
+                mock_sleep.assert_called_once()
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_no_forced_sleep_during_day(self, mock_load):
+        from main import MainWindow
+        w = MainWindow()
+        w._settings.sleep_delay_minutes = 0
+        w._last_interaction_time = time.time() - 10 * 60
+        with patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=14)
+            with patch.object(w, "_enter_sleep") as mock_sleep:
+                w._on_countdown_tick()
+                mock_sleep.assert_not_called()
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_heartbeat_wakes_after_nocturnal_pause(self, mock_load):
+        from main import MainWindow
+        w = MainWindow()
+        w._settings.sleep_delay_minutes = 0
+        with patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=3)
+            w._enter_sleep()
+        assert w._sleeping and w._nocturnal_sleep
+        with patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=5)
+            with patch.object(w, "_refresh_departures"):
+                w._on_heartbeat()
+        assert not w._sleeping
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_tap_wake_not_reslept_by_heartbeat(self, mock_load):
+        """A manual wake during the night must not be immediately re-slept."""
+        from main import MainWindow
+        w = MainWindow()
+        w._settings.sleep_delay_minutes = 0
+        with patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=3)
+            w._enter_sleep()
+            with patch.object(w, "_refresh_departures"):
+                w._wake_up()
+            with patch.object(w, "_enter_sleep") as mock_sleep:
+                w._on_countdown_tick()  # just woke: idle ~0
+                mock_sleep.assert_not_called()
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_heartbeat_ignores_normal_sleep(self, mock_load):
+        """User-configured sleep still requires a tap to wake."""
+        from main import MainWindow
+        w = MainWindow()
+        w._settings.sleep_delay_minutes = 10
+        with patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._enter_sleep()
+        assert w._sleeping and not w._nocturnal_sleep
+        w._on_heartbeat()
+        assert w._sleeping
+        w.close()
+
+
+@pytest.mark.live
+class TestLiveStopSearch:
+    """Live checks for the new stop-first search (network required)."""
+
+    def test_stop_area_search_live(self):
+        worker = StopAreaSearchWorker("pavillon")
+        results = []
+        worker.finished.connect(lambda r, sid: results.extend(r))
+        worker.run()
+        assert len(results) > 0
+        assert any(r.routes for r in results)
+
+    def test_line_details_live(self):
+        worker = LineDetailsWorker(["C02000"])
+        results = []
+        worker.finished.connect(lambda r: results.extend(r))
+        worker.run()
+        assert len(results) == 1
+        assert results[0].line_name

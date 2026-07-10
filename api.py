@@ -1,16 +1,23 @@
 """API workers using QThread/QObject pattern for SIRI Lite and IDFM open data."""
 
+import logging
 import os
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import requests
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from dotenv import load_dotenv
 
-from models import Favourite, Departure, LineAtStop, StopOnLine, normalize, is_same_place
+from models import (
+    Favourite, Departure, LineAtStop, StopOnLine, StopAreaMatch,
+    normalize, is_same_place,
+)
+
+log = logging.getLogger("departs.api")
 
 load_dotenv()
 API_TOKEN = os.getenv("API_TOKEN", "")
@@ -46,6 +53,22 @@ def _natural_sort_key(text: str):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
 
 
+def _network_error_message(e: requests.RequestException) -> str:
+    """Human-readable message, with a hint when the API key is the problem."""
+    response = getattr(e, "response", None)
+    if response is not None and response.status_code in (401, 403):
+        return "Cle API invalide - voir Parametres"
+    return f"Erreur réseau: {e}"
+
+
+def _parse_iso_epoch(iso: str):
+    """Parse an ISO timestamp to an epoch, or None."""
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 # ─── Departure Worker ───────────────────────────────────────────────────────
 
 class DepartureWorker(QObject):
@@ -60,7 +83,6 @@ class DepartureWorker(QObject):
 
     def run(self):
         try:
-            results = {}
             # Group favourites by unique (stop_area_id, line_id) to minimize API calls
             groups = {}
             for fav in self.favourites:
@@ -69,52 +91,79 @@ class DepartureWorker(QObject):
                     groups[key] = []
                 groups[key].append(fav)
 
-            for (stop_area_id, line_id), favs in groups.items():
-                try:
-                    headers = {"apikey": get_api_token()}
-                    params = {
-                        "MonitoringRef": f"STIF:StopArea:SP:{stop_area_id}:",
-                        "LineRef": f"STIF:Line::{line_id}:",
-                    }
-                    resp = requests.get(SIRI_URL, headers=headers, params=params,
-                                        timeout=REQUEST_TIMEOUT)
-                    resp.raise_for_status()
-                    fetch_ts = time.time()
-                    data = resp.json()
+            # Fetch groups in parallel so one slow stop doesn't serialize the
+            # whole refresh (each request can take up to REQUEST_TIMEOUT).
+            group_items = list(groups.items())
+            if len(group_items) == 1:
+                outcomes = [self._fetch_group(*group_items[0])]
+            else:
+                with ThreadPoolExecutor(max_workers=min(4, len(group_items))) as pool:
+                    outcomes = list(pool.map(
+                        lambda item: self._fetch_group(*item), group_items))
 
-                    all_departures = self._parse_departures(data, fetch_ts)
-
-                    # Distribute departures to each favourite based on direction
-                    for fav in favs:
-                        fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
-                        stop_norm = normalize(fav.stop_name)
-                        matched = [
-                            d for d in all_departures
-                            if d.eta_seconds >= 0
-                            and fav.destination_name.lower() in d.destination.lower()
-                            and (not fav.direction or d.direction_ref == fav.direction)
-                            and not is_same_place(stop_norm, normalize(d.destination))
-                        ]
-                        matched.sort(key=lambda d: d.expected_iso or "")
-                        results[fav_key] = matched[:5]
-
-                except requests.RequestException as e:
-                    self.error.emit(f"Erreur réseau: {e}")
-                except (KeyError, ValueError) as e:
-                    self.error.emit(f"Erreur données: {e}")
+            results = {}
+            for partial, error in outcomes:
+                results.update(partial)
+                if error:
+                    log.warning("departure fetch failed: %s", error)
+                    self.error.emit(error)
 
             self.finished.emit(results)
         except Exception as e:
+            log.exception("unexpected error in DepartureWorker")
             self.error.emit(f"Erreur inattendue: {e}")
             self.finished.emit({})
+
+    def _fetch_group(self, key, favs):
+        """Fetch one (stop_area, line) group. Returns (results_dict, error_or_None)."""
+        stop_area_id, line_id = key
+        try:
+            headers = {"apikey": get_api_token()}
+            params = {
+                "MonitoringRef": f"STIF:StopArea:SP:{stop_area_id}:",
+                "LineRef": f"STIF:Line::{line_id}:",
+            }
+            resp = requests.get(SIRI_URL, headers=headers, params=params,
+                                timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            fetch_ts = time.time()
+            data = resp.json()
+
+            all_departures = self._parse_departures(data, fetch_ts)
+
+            # Distribute departures to each favourite based on direction
+            results = {}
+            for fav in favs:
+                fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
+                stop_norm = normalize(fav.stop_name)
+                matched = [
+                    d for d in all_departures
+                    if d.eta_seconds >= 0
+                    and fav.destination_name.lower() in d.destination.lower()
+                    and (not fav.direction or d.direction_ref == fav.direction)
+                    and not is_same_place(stop_norm, normalize(d.destination))
+                ]
+                matched.sort(key=lambda d: d.expected_iso or "")
+                results[fav_key] = matched[:5]
+            return results, None
+
+        except requests.RequestException as e:
+            return {}, _network_error_message(e)
+        except (KeyError, ValueError) as e:
+            return {}, f"Erreur données: {e}"
 
     def _parse_departures(self, data, fetch_ts):
         departures = []
         try:
-            delivery = data["Siri"]["ServiceDelivery"]["StopMonitoringDelivery"][0]
+            service = data["Siri"]["ServiceDelivery"]
+            delivery = service["StopMonitoringDelivery"][0]
             visits = delivery.get("MonitoredStopVisit", [])
         except (KeyError, IndexError):
             return departures
+
+        # ETAs are computed against the server's clock: the Pi has no RTC, so
+        # the local clock can be minutes off right after boot (before NTP).
+        server_ts = _parse_iso_epoch(service.get("ResponseTimestamp", "")) or fetch_ts
 
         for visit in visits:
             journey = visit.get("MonitoredVehicleJourney", {})
@@ -143,15 +192,12 @@ class DepartureWorker(QObject):
             vehicle_at_stop = call.get("VehicleAtStop", False)
             direction_ref = journey.get("DirectionRef", {}).get("value", "")
 
-            # Compute eta_seconds from fetch timestamp
+            # Compute eta_seconds relative to the server timestamp
             eta_seconds = 0.0
             if expected_time:
-                try:
-                    dt = datetime.fromisoformat(expected_time.replace("Z", "+00:00"))
-                    expected_epoch = dt.timestamp()
-                    eta_seconds = expected_epoch - fetch_ts
-                except (ValueError, TypeError):
-                    pass
+                expected_epoch = _parse_iso_epoch(expected_time)
+                if expected_epoch is not None:
+                    eta_seconds = expected_epoch - server_ts
 
             departures.append(Departure(
                 line_name=line_name,
@@ -305,7 +351,7 @@ class ResolveAndProbeWorker(QObject):
                 directions = self._probe_directions(stop_area_id)
                 self.finished.emit(stop_area_id, stop_name, directions)
             except requests.RequestException as e:
-                self.error.emit(f"Erreur directions: {e}")
+                self.error.emit(_network_error_message(e))
                 self.finished.emit(stop_area_id, stop_name, [])
         except Exception as e:
             self.error.emit(f"Erreur inattendue: {e}")
@@ -365,6 +411,109 @@ class ResolveAndProbeWorker(QObject):
                 destinations[dest] = dir_ref
 
         return [(name, ref) for name, ref in destinations.items()]
+
+
+# ─── Stop Area Search Worker ────────────────────────────────────────────────
+
+class StopAreaSearchWorker(QObject):
+    """Searches stops by name via arrets-lignes, grouped by (stop name, town)."""
+
+    finished = pyqtSignal(list, int)  # [StopAreaMatch, ...], search_id
+    error = pyqtSignal(str)
+
+    def __init__(self, query: str, search_id: int = 0):
+        super().__init__()
+        self.query = query
+        self.search_id = search_id
+
+    def run(self):
+        try:
+            url = f"{OPEN_DATA_BASE}/catalog/datasets/{STOP_LINES_DATASET}/records"
+            params = {
+                "where": f'search(stop_name, "{_sanitize_odsql(self.query)}")',
+                "limit": 100,
+            }
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+
+            matches = {}  # (stop_name, town) -> StopAreaMatch
+            for record in data.get("results", []):
+                name = record.get("stop_name") or ""
+                route_id = record.get("id") or ""  # "IDFM:C01371"
+                stop_id = record.get("stop_id") or ""
+                if not name or not route_id:
+                    continue
+                town = record.get("nom_commune") or ""
+                line_id = route_id.split(":")[-1]
+                match = matches.setdefault((name, town),
+                                           StopAreaMatch(stop_name=name, town=town))
+                match.routes.setdefault(line_id, stop_id)
+
+            results = sorted(matches.values(), key=lambda m: (m.stop_name, m.town))
+            self.finished.emit(results, self.search_id)
+        except requests.RequestException as e:
+            self.error.emit(f"Erreur recherche: {e}")
+            self.finished.emit([], self.search_id)
+        except Exception as e:
+            log.exception("unexpected error in StopAreaSearchWorker")
+            self.error.emit(f"Erreur inattendue: {e}")
+            self.finished.emit([], self.search_id)
+
+
+# ─── Line Details Worker ────────────────────────────────────────────────────
+
+class LineDetailsWorker(QObject):
+    """Fetches full line info (name, colours) for a set of line ids."""
+
+    finished = pyqtSignal(list)  # [LineAtStop, ...]
+    error = pyqtSignal(str)
+
+    MAX_LINES = 40  # keep the OR-joined where clause bounded
+
+    def __init__(self, line_ids: list):
+        super().__init__()
+        self.line_ids = list(line_ids)[:self.MAX_LINES]
+
+    def run(self):
+        try:
+            if not self.line_ids:
+                self.finished.emit([])
+                return
+            url = f"{OPEN_DATA_BASE}/catalog/datasets/{LINES_DATASET}/records"
+            where = " OR ".join(
+                f'id_line="{_sanitize_odsql(lid)}"' for lid in self.line_ids
+            )
+            params = {
+                "select": "id_line,shortname_line,name_line,transportmode,colourweb_hexa,textcolourweb_hexa",
+                "where": where,
+                "limit": 100,
+            }
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+
+            results = []
+            for record in data.get("results", []):
+                line_id = record.get("id_line", "")
+                results.append(LineAtStop(
+                    line_id=line_id,
+                    line_name=record.get("shortname_line") or record.get("name_line") or "",
+                    mode=record.get("transportmode") or "",
+                    line_color=record.get("colourweb_hexa") or "FFFFFF",
+                    line_text_color=record.get("textcolourweb_hexa") or "000000",
+                    route_id=f"IDFM:{line_id}",
+                ))
+
+            results.sort(key=lambda l: _natural_sort_key(l.line_name))
+            self.finished.emit(results)
+        except requests.RequestException as e:
+            self.error.emit(f"Erreur lignes: {e}")
+            self.finished.emit([])
+        except Exception as e:
+            log.exception("unexpected error in LineDetailsWorker")
+            self.error.emit(f"Erreur inattendue: {e}")
+            self.finished.emit([])
 
 
 # ─── WiFi Scan Worker ────────────────────────────────────────────────────────
