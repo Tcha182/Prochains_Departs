@@ -28,6 +28,7 @@ WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 480
 AUTO_REFRESH_MS = 1 * 60 * 1000  # 1 minute
 COUNTDOWN_MS = 1000  # 1 second
+KEYBOARD_HEIGHT = 220
 
 
 class MainWindow(QMainWindow):
@@ -96,6 +97,11 @@ class MainWindow(QMainWindow):
         self.sleep_overlay = SleepOverlay(self)
         self.sleep_overlay.tapped.connect(self._wake_up)
 
+        # Track touch activity app-wide for the sleep timer. Events accepted
+        # by child widgets (buttons, list rows) never propagate up to this
+        # window, so a plain event() override misses most interactions.
+        QApplication.instance().installEventFilter(self)
+
     def _setup_timers(self):
         # Auto-refresh timer
         self.refresh_timer = QTimer(self)
@@ -123,15 +129,15 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self.sleep_overlay.setGeometry(self.rect())
         # Position keyboard at the bottom
-        kb_h = 220
-        self.keyboard.setGeometry(0, self.height() - kb_h, self.width(), kb_h)
+        self.keyboard.setGeometry(0, self.height() - KEYBOARD_HEIGHT,
+                                  self.width(), KEYBOARD_HEIGHT)
 
     def _on_focus_changed(self, old, new):
         """Show/hide virtual keyboard when QLineEdit gains/loses focus."""
         if isinstance(new, QLineEdit):
             self.keyboard.set_target(new)
-            kb_h = 220
-            self.keyboard.setGeometry(0, self.height() - kb_h, self.width(), kb_h)
+            self.keyboard.setGeometry(0, self.height() - KEYBOARD_HEIGHT,
+                                      self.width(), KEYBOARD_HEIGHT)
             self.keyboard.show()
             self.keyboard.raise_()
         else:
@@ -139,10 +145,11 @@ class MainWindow(QMainWindow):
 
     # ── Event tracking for sleep mode ─────────────────────────────────────────
 
-    def event(self, event):
-        if event.type() in (QEvent.MouseButtonPress, QEvent.TouchBegin):
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.MouseButtonPress, QEvent.MouseMove,
+                            QEvent.TouchBegin, QEvent.TouchUpdate):
             self._last_interaction_time = time.time()
-        return super().event(event)
+        return super().eventFilter(obj, event)
 
     # ── Navigation ───────────────────────────────────────────────────────────
 
@@ -191,11 +198,11 @@ class MainWindow(QMainWindow):
 
     # ── Worker lifecycle ─────────────────────────────────────────────────────
 
-    def _launch_worker(self, worker, on_finished):
+    def _launch_worker(self, worker, on_finished, on_error=None):
         """Wire up a worker's signals, move it to a thread, and start it."""
         worker.finished.connect(on_finished)
-        if hasattr(worker, "error"):
-            worker.error.connect(self._on_departure_error)
+        if on_error is not None and hasattr(worker, "error"):
+            worker.error.connect(on_error)
         thread, worker = start_worker(worker, self)
         self._active_threads.append(thread)
         self._active_workers.append(worker)
@@ -208,7 +215,9 @@ class MainWindow(QMainWindow):
             self._rebuild_home()
             return
 
-        self._launch_worker(DepartureWorker(list(self.favourites)), self._on_departures_received)
+        self._launch_worker(DepartureWorker(list(self.favourites)),
+                            self._on_departures_received,
+                            on_error=self._on_departure_error)
         self.home.set_updated_time("Mise a jour...")
 
     def _on_departures_received(self, dep_map: dict):
@@ -314,13 +323,19 @@ class MainWindow(QMainWindow):
 
     def _on_line_search(self, query: str, mode: str):
         search_id = self.search._search_id
-        self._launch_worker(LineSearchWorker(query, mode, search_id), self.search.on_line_results)
+        self._launch_worker(LineSearchWorker(query, mode, search_id),
+                            self.search.on_line_results,
+                            on_error=self.search.show_error)
 
     def _on_stops_on_line(self, route_id: str):
-        self._launch_worker(StopsOnLineWorker(route_id), self.search.on_stop_results)
+        self._launch_worker(StopsOnLineWorker(route_id),
+                            self.search.on_stop_results,
+                            on_error=self.search.show_error)
 
     def _on_resolve_and_probe(self, stop_id: str, line_id: str):
-        self._launch_worker(ResolveAndProbeWorker(stop_id, line_id), self.search.on_directions_results)
+        self._launch_worker(ResolveAndProbeWorker(stop_id, line_id),
+                            self.search.on_directions_results,
+                            on_error=self.search.show_error)
 
     # ── Thread/worker cleanup ────────────────────────────────────────────────
 
