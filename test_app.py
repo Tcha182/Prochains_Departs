@@ -1696,6 +1696,91 @@ class TestStopAreaSearchWorker:
         assert len(errors) == 1
 
 
+def _ods_response(status_code=200, results=None):
+    """Response stub honouring status_code the way _text_search_records reads it."""
+    import requests as _requests
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = "ODSQL parse error" if status_code == 400 else ""
+    resp.json.return_value = {"results": results or []}
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = _requests.HTTPError(response=resp)
+    else:
+        resp.raise_for_status = MagicMock()
+    return resp
+
+
+class TestOdsqlTextSearchFallback:
+    """search() is not valid ODSQL v2.1 — the workers must use suggest()
+    and degrade through like / bare full-text when a portal rejects it."""
+
+    RECORD = {"stop_name": "Mairie", "id": "IDFM:C01111", "stop_id": "IDFM:1",
+              "nom_commune": "Pantin"}
+
+    @patch("api.requests.get")
+    def test_stop_search_uses_suggest(self, mock_get):
+        mock_get.return_value = _ods_response(results=[self.RECORD])
+        worker = StopAreaSearchWorker("mairie")
+        results = []
+        worker.finished.connect(lambda r, sid: results.extend(r))
+        worker.run()
+        assert len(results) == 1
+        assert mock_get.call_count == 1
+        where = mock_get.call_args.kwargs["params"]["where"]
+        assert where == 'suggest(stop_name, "mairie")'
+
+    @patch("api.requests.get")
+    def test_stop_search_falls_back_to_like_then_fulltext(self, mock_get):
+        mock_get.side_effect = [
+            _ods_response(400),
+            _ods_response(400),
+            _ods_response(results=[self.RECORD]),
+        ]
+        worker = StopAreaSearchWorker("mairie")
+        results, errors = [], []
+        worker.finished.connect(lambda r, sid: results.extend(r))
+        worker.error.connect(errors.append)
+        worker.run()
+        assert len(results) == 1
+        assert errors == []
+        wheres = [c.kwargs["params"]["where"] for c in mock_get.call_args_list]
+        assert wheres == [
+            'suggest(stop_name, "mairie")',
+            'stop_name like "mairie"',
+            '"mairie"',
+        ]
+
+    @patch("api.requests.get")
+    def test_stop_search_all_variants_rejected_emits_error(self, mock_get):
+        mock_get.side_effect = [_ods_response(400)] * 3
+        worker = StopAreaSearchWorker("mairie", 5)
+        results, errors = [], []
+        worker.finished.connect(lambda r, sid: results.append((list(r), sid)))
+        worker.error.connect(errors.append)
+        worker.run()
+        assert results == [([], 5)]
+        assert len(errors) == 1
+
+    @patch("api.requests.get")
+    def test_line_search_combines_suggest_and_mode(self, mock_get):
+        mock_get.return_value = _ods_response()
+        worker = LineSearchWorker("62", "bus")
+        worker.finished.connect(lambda r, sid: None)
+        worker.run()
+        where = mock_get.call_args.kwargs["params"]["where"]
+        assert where == 'suggest(shortname_line, "62") AND transportmode="bus"'
+
+    @patch("api.requests.get")
+    def test_mode_only_listing_needs_no_text_filter(self, mock_get):
+        mock_get.return_value = _ods_response()
+        worker = LineSearchWorker("", "bus")
+        worker.finished.connect(lambda r, sid: None)
+        worker.run()
+        assert mock_get.call_count == 1
+        where = mock_get.call_args.kwargs["params"]["where"]
+        assert where == 'transportmode="bus"'
+
+
 class TestLineDetailsWorker:
     @patch("api.requests.get")
     def test_builds_or_where_clause(self, mock_get):
