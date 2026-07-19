@@ -69,6 +69,38 @@ def _parse_iso_epoch(iso: str):
         return None
 
 
+def _text_search_records(url: str, field: str, query: str,
+                         base_params: dict, extra_where: str = "") -> dict:
+    """GET records whose `field` matches `query`, probing ODSQL text filters.
+
+    Explore v2.1 has no search() function (that was v1's #search); a where
+    clause using it is rejected with 400, which the UI showed as an
+    eternally empty stop list. Valid v2.1 spellings differ in matching
+    behaviour, so try them best-first and fall through on a 400:
+    suggest() matches word prefixes (ideal while typing), like matches
+    whole words in the field, and a bare quoted string is the last-resort
+    full-text search across all fields.
+    """
+    q = _sanitize_odsql(query)
+    variants = [
+        f'suggest({field}, "{q}")',
+        f'{field} like "{q}"',
+        f'"{q}"',
+    ]
+    resp = None
+    for where in variants:
+        params = dict(base_params)
+        params["where"] = f"{where} AND {extra_where}" if extra_where else where
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 400:
+            log.warning("ODSQL filter rejected (%s): %s", where, resp.text[:200])
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    resp.raise_for_status()  # all variants rejected: surface the last 400
+    return resp.json()
+
+
 # ─── Departure Worker ───────────────────────────────────────────────────────
 
 class DepartureWorker(QObject):
@@ -231,20 +263,20 @@ class LineSearchWorker(QObject):
     def run(self):
         try:
             url = f"{OPEN_DATA_BASE}/catalog/datasets/{LINES_DATASET}/records"
-            where_parts = []
-            if self.query:
-                where_parts.append(f'search(shortname_line, "{_sanitize_odsql(self.query)}")')
-            if self.mode:
-                where_parts.append(f'transportmode="{_sanitize_odsql(self.mode)}"')
+            mode_clause = f'transportmode="{_sanitize_odsql(self.mode)}"' if self.mode else ""
             params = {
                 "select": "id_line,shortname_line,name_line,transportmode,colourweb_hexa,textcolourweb_hexa",
                 "limit": 100,  # API maximum; 20 truncated the mode-wide line list
             }
-            if where_parts:
-                params["where"] = " AND ".join(where_parts)
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
+            if self.query:
+                data = _text_search_records(url, "shortname_line", self.query,
+                                            params, extra_where=mode_clause)
+            else:
+                if mode_clause:
+                    params["where"] = mode_clause
+                resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                resp.raise_for_status()
+                data = resp.json()
 
             results = []
             for record in data.get("results", []):
@@ -429,13 +461,8 @@ class StopAreaSearchWorker(QObject):
     def run(self):
         try:
             url = f"{OPEN_DATA_BASE}/catalog/datasets/{STOP_LINES_DATASET}/records"
-            params = {
-                "where": f'search(stop_name, "{_sanitize_odsql(self.query)}")',
-                "limit": 100,
-            }
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
+            data = _text_search_records(url, "stop_name", self.query,
+                                        {"limit": 100})
 
             matches = {}  # (stop_name, town) -> StopAreaMatch
             for record in data.get("results", []):
