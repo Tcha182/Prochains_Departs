@@ -23,7 +23,7 @@ from models import (
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
     ResolveAndProbeWorker, StopAreaSearchWorker, LineDetailsWorker,
-    WiFiScanWorker, WiFiConnectWorker,
+    WiFiScanWorker, WiFiConnectWorker, UpdateWorker,
     start_worker,
 )
 from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard
@@ -133,6 +133,7 @@ class MainWindow(QMainWindow):
         self.settings_screen.wifi_scan_requested.connect(self._on_wifi_scan)
         self.settings_screen.wifi_connect_requested.connect(self._on_wifi_connect)
         self.settings_screen.api_token_saved.connect(self._on_api_token_saved)
+        self.settings_screen.update_check_requested.connect(self._on_check_update)
         self.stack.addWidget(self.settings_screen)
 
         # Virtual keyboard (child widget, overlays at bottom)
@@ -408,6 +409,18 @@ class MainWindow(QMainWindow):
 
     def _on_wifi_connect(self, ssid: str, password: str):
         self._launch_worker(WiFiConnectWorker(ssid, password), self.settings_screen.on_wifi_connect_result)
+
+    # ── Update worker ────────────────────────────────────────────────────────
+
+    def _on_check_update(self):
+        self._launch_worker(UpdateWorker(), self._on_update_result)
+
+    def _on_update_result(self, updated: bool, message: str):
+        self.settings_screen.on_update_result(updated, message)
+        if updated:
+            # New code is already on disk; exit and let systemd's
+            # Restart=always (departure-display.service) relaunch us with it.
+            QTimer.singleShot(1500, QApplication.instance().quit)
 
     # ── Search API calls ─────────────────────────────────────────────────────
 

@@ -122,7 +122,9 @@ The Pi is fully autonomous:
 
 The app automatically checks for updates daily at 3:30am (via a systemd timer). If new code is found on GitHub, it pulls and restarts the service. OS security patches are also automatic (via `unattended-upgrades`).
 
-To update manually:
+You can also trigger a check on demand from **Parametres > Mise a jour** on the touchscreen: it pulls from GitHub and, if there's new code, exits so `Restart=always` relaunches the app with it.
+
+To update manually via SSH:
 
 ```bash
 ssh pi@prochains-departs.local

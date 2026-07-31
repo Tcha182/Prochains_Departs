@@ -41,6 +41,7 @@ def _sanitize_odsql(value: str) -> str:
 
 SIRI_URL = "https://prim.iledefrance-mobilites.fr/marketplace/stop-monitoring"
 OPEN_DATA_BASE = "https://data.iledefrance-mobilites.fr/api/explore/v2.1"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STOPS_DATASET = "arrets"
 STOP_LINES_DATASET = "arrets-lignes"
 LINES_DATASET = "referentiel-des-lignes"
@@ -627,6 +628,51 @@ class WiFiConnectWorker(QObject):
             self.finished.emit(False, str(e))
         except Exception as e:
             self.finished.emit(False, f"Erreur inattendue: {e}")
+
+
+# ─── Update Worker ───────────────────────────────────────────────────────────
+
+class UpdateWorker(QObject):
+    """Pulls app updates from git. Doesn't restart anything itself — the
+    caller must exit the process; systemd's Restart=always (see
+    departure-display.service) relaunches it with the pulled code."""
+
+    finished = pyqtSignal(bool, str)  # updated, message
+
+    def run(self):
+        try:
+            before = self._head()
+            result = subprocess.run(
+                ["git", "-C", APP_DIR, "pull"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                msg = result.stderr.strip() or result.stdout.strip() or "Echec de la mise a jour"
+                log.warning("app update failed: %s", msg)
+                self.finished.emit(False, "Erreur de mise a jour")
+                return
+
+            after = self._head()
+            if after and after != before:
+                log.info("app updated %s -> %s", before[:8], after[:8])
+                self.finished.emit(True, "Mise a jour installee, redemarrage...")
+            else:
+                self.finished.emit(False, "Deja a jour")
+        except subprocess.TimeoutExpired:
+            self.finished.emit(False, "Delai d'attente depasse")
+        except OSError as e:
+            log.warning("app update check failed: %s", e)
+            self.finished.emit(False, "Git non disponible")
+        except Exception as e:
+            log.exception("unexpected error in UpdateWorker")
+            self.finished.emit(False, f"Erreur inattendue: {e}")
+
+    def _head(self) -> str:
+        result = subprocess.run(
+            ["git", "-C", APP_DIR, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
 
 
 # ─── Helper: create and start a worker on a thread ──────────────────────────

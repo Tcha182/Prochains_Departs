@@ -505,11 +505,13 @@ class SettingsScreen(QWidget):
     wifi_scan_requested = pyqtSignal()
     wifi_connect_requested = pyqtSignal(str, str)  # ssid, password
     api_token_saved = pyqtSignal(str)
+    update_check_requested = pyqtSignal()
 
     def __init__(self, current_theme: str = "dark", current_sleep: int = 10, parent=None):
         super().__init__(parent)
         self._theme = current_theme
         self._sleep = current_sleep
+        self._update_in_progress = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -577,6 +579,11 @@ class SettingsScreen(QWidget):
         self.sleep_row.tapped.connect(self._cycle_sleep)
         content_layout.addWidget(self.sleep_row)
 
+        # Update row
+        self.update_row = self._make_settings_row("Mise a jour", "Verifier")
+        self.update_row.tapped.connect(self._on_check_update_pressed)
+        content_layout.addWidget(self.update_row)
+
         content_layout.addStretch()
         layout.addWidget(content, stretch=1)
 
@@ -615,6 +622,21 @@ class SettingsScreen(QWidget):
         self._sleep = SLEEP_OPTIONS[(idx + 1) % len(SLEEP_OPTIONS)]
         self.sleep_row._value_label.setText(SLEEP_LABELS.get(self._sleep, f"{self._sleep} min"))
         self.sleep_delay_changed.emit(self._sleep)
+
+    def _on_check_update_pressed(self):
+        if self._update_in_progress:
+            return
+        self._update_in_progress = True
+        self.update_row._value_label.setText("Verification...")
+        self.update_check_requested.emit()
+
+    def on_update_result(self, updated: bool, message: str):
+        """Called from main window when the update check finishes."""
+        self.update_row._value_label.setText(message)
+        if updated:
+            return  # app is about to restart, leave the message as-is
+        self._update_in_progress = False
+        QTimer.singleShot(3000, lambda: self.update_row._value_label.setText("Verifier"))
 
     def _open_wifi(self):
         self.wifi_status.setText("Recherche...")
