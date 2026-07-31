@@ -914,6 +914,7 @@ class SearchScreen(QWidget):
         self._stop_debounce_timer.setInterval(600)
         self._stop_debounce_timer.timeout.connect(self._do_stop_search)
         self._stop_search_id = 0
+        self._had_error = False  # set by show_error, consumed by the next results handler
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1084,6 +1085,9 @@ class SearchScreen(QWidget):
         # Ignore stale results from earlier searches
         if search_id and search_id != self._search_id:
             return
+        if self._had_error:
+            self._had_error = False
+            return
         self.line_loading.setText("")
         self._clear_layout(self.line_results_layout)
 
@@ -1178,6 +1182,9 @@ class SearchScreen(QWidget):
 
     def on_stop_results(self, stops: list):
         """Called when stops-on-line results arrive."""
+        if self._had_error:
+            self._had_error = False
+            return
         self.stop_loading.setText("")
         self._all_stops = list(stops)
         self._display_filtered_stops()
@@ -1259,6 +1266,9 @@ class SearchScreen(QWidget):
 
         directions = [(destination_name, direction_ref), ...]
         """
+        if self._had_error:
+            self._had_error = False
+            return
         self.dir_loading.setText("")
         self._resolved_stop_area_id = stop_area_id
         self._resolved_stop_name = stop_name
@@ -1376,6 +1386,9 @@ class SearchScreen(QWidget):
         """Called when stop-name search results arrive."""
         if search_id and search_id != self._stop_search_id:
             return
+        if self._had_error:
+            self._had_error = False
+            return
         self.stop_search_loading.setText("")
         self._clear_layout(self.stop_search_results_layout)
 
@@ -1406,6 +1419,9 @@ class SearchScreen(QWidget):
 
     def on_lines_at_stop_results(self, lines: list):
         """Called when line details for the selected stop arrive."""
+        if self._had_error:
+            self._had_error = False
+            return
         self.lines_at_stop_loading.setText("")
         self._clear_layout(self.lines_at_stop_layout)
 
@@ -1452,7 +1468,13 @@ class SearchScreen(QWidget):
     # ── Helpers ──
 
     def show_error(self, msg: str):
-        """Show a worker error on the loading label of the current step."""
+        """Show a worker error on the loading label of the current step.
+
+        The paired `finished` signal always follows (workers must emit it to
+        let the QThread quit), which would otherwise immediately overwrite
+        this message with an empty-results placeholder. `_had_error` tells
+        the next results handler to leave the error message alone instead.
+        """
         labels = {
             1: self.line_loading,
             2: self.stop_loading,
@@ -1463,6 +1485,7 @@ class SearchScreen(QWidget):
         label = labels.get(self.stack.currentIndex())
         if label:
             label.setText(msg)
+        self._had_error = True
 
     def _make_result_item(self, title, subtitle, on_click):
         """Create a clickable result item frame."""

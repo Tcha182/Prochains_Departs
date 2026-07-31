@@ -294,9 +294,11 @@ class LineSearchWorker(QObject):
             results.sort(key=lambda l: _natural_sort_key(l.line_name))
             self.finished.emit(results, self.search_id)
         except requests.RequestException as e:
+            log.warning("line search failed: %s", e)
             self.error.emit(f"Erreur recherche: {e}")
             self.finished.emit([], self.search_id)
         except Exception as e:
+            log.exception("unexpected error in LineSearchWorker")
             self.error.emit(f"Erreur inattendue: {e}")
             self.finished.emit([], self.search_id)
 
@@ -340,9 +342,11 @@ class StopsOnLineWorker(QObject):
             results.sort(key=lambda s: s.stop_name)
             self.finished.emit(results)
         except requests.RequestException as e:
+            log.warning("stops-on-line fetch failed: %s", e)
             self.error.emit(f"Erreur arrets: {e}")
             self.finished.emit([])
         except Exception as e:
+            log.exception("unexpected error in StopsOnLineWorker")
             self.error.emit(f"Erreur inattendue: {e}")
             self.finished.emit([])
 
@@ -374,6 +378,7 @@ class ResolveAndProbeWorker(QObject):
                     self.finished.emit("", "", [])
                     return
             except requests.RequestException as e:
+                log.warning("stop resolution failed: %s", e)
                 self.error.emit(f"Erreur resolution: {e}")
                 self.finished.emit("", "", [])
                 return
@@ -383,9 +388,11 @@ class ResolveAndProbeWorker(QObject):
                 directions = self._probe_directions(stop_area_id)
                 self.finished.emit(stop_area_id, stop_name, directions)
             except requests.RequestException as e:
+                log.warning("direction probe failed: %s", e)
                 self.error.emit(_network_error_message(e))
                 self.finished.emit(stop_area_id, stop_name, [])
         except Exception as e:
+            log.exception("unexpected error in ResolveAndProbeWorker")
             self.error.emit(f"Erreur inattendue: {e}")
             self.finished.emit("", "", [])
 
@@ -480,6 +487,7 @@ class StopAreaSearchWorker(QObject):
             results = sorted(matches.values(), key=lambda m: (m.stop_name, m.town))
             self.finished.emit(results, self.search_id)
         except requests.RequestException as e:
+            log.warning("stop-name search failed: %s", e)
             self.error.emit(f"Erreur recherche: {e}")
             self.finished.emit([], self.search_id)
         except Exception as e:
@@ -535,6 +543,7 @@ class LineDetailsWorker(QObject):
             results.sort(key=lambda l: _natural_sort_key(l.line_name))
             self.finished.emit(results)
         except requests.RequestException as e:
+            log.warning("line details fetch failed: %s", e)
             self.error.emit(f"Erreur lignes: {e}")
             self.finished.emit([])
         except Exception as e:

@@ -156,6 +156,7 @@ class MainWindow(QMainWindow):
         self.refresh_timer.start()
         self._last_refresh_time = None
         self._next_refresh_epoch = None
+        self._departure_error_msg = None
 
         # Countdown timer (1 second)
         self.countdown_timer = QTimer(self)
@@ -269,6 +270,7 @@ class MainWindow(QMainWindow):
             self._rebuild_home()
             return
 
+        self._departure_error_msg = None
         self._launch_worker(DepartureWorker(list(self.favourites)),
                             self._on_departures_received,
                             on_error=self._on_departure_error)
@@ -278,12 +280,18 @@ class MainWindow(QMainWindow):
         self.departure_map.update(dep_map)
         self._last_refresh_time = datetime.now()
         self._next_refresh_epoch = self._last_refresh_time.timestamp() + AUTO_REFRESH_MS / 1000
-        self.home.set_updated_time(
-            f"Mis a jour a {self._last_refresh_time.strftime('%H:%M')}"
-        )
+        if not dep_map and self._departure_error_msg:
+            # Every group failed: keep the real error visible instead of
+            # claiming a successful update that fetched nothing.
+            self.home.set_updated_time(self._departure_error_msg)
+        else:
+            self.home.set_updated_time(
+                f"Mis a jour a {self._last_refresh_time.strftime('%H:%M')}"
+            )
         self._rebuild_home()
 
     def _on_departure_error(self, msg: str):
+        self._departure_error_msg = msg
         self.home.set_updated_time(msg)
 
     @staticmethod
