@@ -125,21 +125,46 @@ systemctl enable departure-display
 echo "==> Creating update script..."
 cat > "$APP_DIR/update.sh" << 'UPDATE'
 #!/usr/bin/env bash
-set -euo pipefail
+# Pull the latest code from GitHub and restart the app if it changed.
+# Runs at boot and nightly (app-update.timer), and by hand over SSH.
+# Every step is time-bounded and failures just mean "try again next
+# time": the display keeps running whatever code is already on disk.
+set -uo pipefail
 cd /home/pi/app
+
+# Never wait for a credentials prompt or a stalled connection.
+export GIT_TERMINAL_PROMPT=0
+export GIT_HTTP_LOW_SPEED_LIMIT=1000
+export GIT_HTTP_LOW_SPEED_TIME=30
+
+# At boot WiFi may still be connecting: give GitHub a few minutes.
+for _ in $(seq 1 18); do
+    timeout 10 git ls-remote --exit-code origin HEAD >/dev/null 2>&1 && break
+    sleep 10
+done
+
 before=$(git rev-parse HEAD)
-git pull
+if ! timeout 120 git fetch --quiet origin; then
+    echo "Fetch failed (offline?), keeping current version."
+    exit 0
+fi
+# Fast-forward only: a diverged or locally edited checkout is left alone
+# rather than half-merged.
+if ! git merge --ff-only --quiet '@{u}'; then
+    echo "Cannot fast-forward, keeping current version."
+    exit 0
+fi
 after=$(git rev-parse HEAD)
 if [ "$before" != "$after" ]; then
-    sudo systemctl restart departure-display
-    echo "Updated and restarted."
+    sudo -n systemctl restart departure-display
+    echo "Updated ${before:0:8} -> ${after:0:8} and restarted."
 else
     echo "Already up to date."
 fi
 UPDATE
 chmod +x "$APP_DIR/update.sh"
 
-echo "==> Scheduling daily app updates..."
+echo "==> Scheduling app updates (at boot and nightly)..."
 cat > /etc/systemd/system/app-update.service << 'AUUNIT'
 [Unit]
 Description=Update Prochains Departs from GitHub
@@ -151,16 +176,22 @@ Type=oneshot
 User=pi
 WorkingDirectory=/home/pi/app
 ExecStart=/home/pi/app/update.sh
+# Hard cap so a stuck update can never linger
+TimeoutStartSec=10min
+Nice=10
 AUUNIT
 
+# Started by the timer only (never WantedBy a boot target), so boot and
+# the display never wait on it: the app starts with the code on disk and
+# is restarted once, a minute later, only if new code was pulled.
 cat > /etc/systemd/system/app-update.timer << 'AUTIMER'
 [Unit]
-Description=Daily app update check
+Description=App update check at boot and nightly
 
 [Timer]
+OnBootSec=1min
 OnCalendar=*-*-* 03:30
 RandomizedDelaySec=300
-Persistent=true
 
 [Install]
 WantedBy=timers.target
@@ -213,6 +244,7 @@ echo ""
 echo "After reboot the Pi is fully autonomous:"
 echo "  - App starts automatically on the touchscreen"
 echo "  - Update with: ssh pi@<ip> 'cd /home/pi/app && ./update.sh'"
+echo "  - App updates from GitHub at boot and nightly (3:30am)"
 echo "  - OS security updates install daily, auto-reboot at 4am if needed"
 echo "  - Hardware watchdog reboots the Pi if it ever freezes"
 echo "  - Network watchdog restarts WiFi (or reboots) if the network drops"
