@@ -114,7 +114,7 @@ The Pi is fully autonomous:
 - Auto-login on tty1, starts X11 with Openbox
 - App launches via systemd (`departure-display.service`, `After=multi-user.target`)
 - Restarts automatically if it crashes (`Restart=always`) or hangs (systemd watchdog, `WatchdogSec=120` — the app pings every 30s)
-- App updates daily at 3:30am from GitHub (only restarts if code changed)
+- App updates from GitHub about a minute after boot and daily at 3:30am (only restarts if code changed; never delays boot)
 - OS security updates install daily, auto-reboot at 4am if needed
 - Hardware watchdog reboots the Pi if it freezes
 - Network hardening (`pi-network-setup.sh`): WiFi power saving off, WiFi reconnects forever, and a network watchdog (every 2 min) that restarts NetworkManager when the IDFM APIs are unreachable, or reboots if the local network stays down ~10 min
@@ -122,7 +122,7 @@ The Pi is fully autonomous:
 
 ### Updating the app
 
-The app automatically checks for updates daily at 3:30am (via a systemd timer). If new code is found on GitHub, it pulls and restarts the service. OS security patches are also automatic (via `unattended-upgrades`).
+The app automatically checks for updates about a minute after each boot and daily at 3:30am (via a systemd timer, so boot never waits on it). If new code is found on GitHub, it fast-forwards and restarts the service; if the network is down or the fetch fails, it keeps running the current version and retries next time. OS security patches are also automatic (via `unattended-upgrades`).
 
 You can also trigger a check on demand from **Parametres > Mise a jour** on the touchscreen: it pulls from GitHub and, if there's new code, exits so `Restart=always` relaunches the app with it.
 
