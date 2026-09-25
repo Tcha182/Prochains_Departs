@@ -1969,7 +1969,7 @@ class TestNocturnalSleep:
         from main import MainWindow
         w = MainWindow()
         w._settings.sleep_delay_minutes = 0  # sleep disabled by user
-        w._last_interaction_time = time.time() - 10 * 60
+        w._last_interaction_time = time.monotonic() - 10 * 60
         with patch("main.datetime") as mock_dt:
             mock_dt.now.return_value = MagicMock(hour=3)
             with patch.object(w, "_enter_sleep") as mock_sleep:
@@ -1982,7 +1982,7 @@ class TestNocturnalSleep:
         from main import MainWindow
         w = MainWindow()
         w._settings.sleep_delay_minutes = 0
-        w._last_interaction_time = time.time() - 10 * 60
+        w._last_interaction_time = time.monotonic() - 10 * 60
         with patch("main.datetime") as mock_dt:
             mock_dt.now.return_value = MagicMock(hour=14)
             with patch.object(w, "_enter_sleep") as mock_sleep:
@@ -2056,3 +2056,130 @@ class TestLiveStopSearch:
         worker.run()
         assert len(results) == 1
         assert results[0].line_name
+
+
+class TestRefreshRobustness:
+    """Regressions for 'updates once, then never again until a reboot'."""
+
+    @patch("main.load_favourites")
+    def test_single_fetch_in_flight(self, mock_load, sample_favourite):
+        from main import MainWindow
+        mock_load.return_value = [sample_favourite]
+        w = MainWindow()
+        with patch.object(w, "_launch_worker") as launch:
+            w._refresh_departures()
+            w._refresh_departures()  # auto-refresh while the first still runs
+            assert launch.call_count == 1
+            w._refresh_departures(force=True)  # user tap supersedes it
+            assert launch.call_count == 2
+        w.close()
+
+    @patch("main.load_favourites")
+    def test_stuck_fetch_is_abandoned(self, mock_load, sample_favourite):
+        import main
+        mock_load.return_value = [sample_favourite]
+        w = main.MainWindow()
+        with patch.object(w, "_launch_worker") as launch:
+            w._refresh_departures()
+            w._departure_started_at -= main.REFRESH_STALL_SECONDS + 1
+            w._refresh_departures()
+            assert launch.call_count == 2
+        w.close()
+
+    @patch("main.load_favourites")
+    def test_late_results_from_superseded_fetch_ignored(self, mock_load,
+                                                        sample_favourite, sample_departure):
+        from main import MainWindow
+        mock_load.return_value = [sample_favourite]
+        w = MainWindow()
+        with patch.object(w, "_launch_worker"):
+            w._refresh_departures()
+            old_gen = w._departure_generation
+            w._refresh_departures(force=True)
+        w._on_departures_received({"old": [sample_departure]}, old_gen)
+        assert "old" not in w.departure_map
+        w._on_departures_received({"new": [sample_departure]}, w._departure_generation)
+        assert "new" in w.departure_map
+        assert w._departure_started_at is None
+        w.close()
+
+    @patch("main.load_favourites")
+    def test_self_restart_when_refreshes_keep_failing(self, mock_load, sample_favourite):
+        import main
+        mock_load.return_value = [sample_favourite]
+        w = main.MainWindow()
+        w._last_departure_success -= main.SELF_RESTART_AFTER_SECONDS + 1
+        with patch("main.datetime") as mock_dt, \
+                patch.object(main.QApplication, "instance") as inst:
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._on_heartbeat()
+            inst.return_value.exit.assert_called_once_with(1)
+        w.close()
+
+    @patch("main.load_favourites")
+    def test_no_self_restart_while_sleeping(self, mock_load, sample_favourite):
+        import main
+        mock_load.return_value = [sample_favourite]
+        w = main.MainWindow()
+        w._sleeping = True
+        w._last_departure_success -= main.SELF_RESTART_AFTER_SECONDS + 1
+        with patch("main.datetime") as mock_dt, \
+                patch.object(main.QApplication, "instance") as inst:
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._check_refresh_health()
+            inst.return_value.exit.assert_not_called()
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_idle_uses_monotonic_clock(self, mock_load):
+        """An NTP jump of the wall clock after boot must not trigger sleep."""
+        import main
+        w = main.MainWindow()
+        w._settings.sleep_delay_minutes = 10
+        with patch("main.datetime") as mock_dt, \
+                patch.object(w, "_enter_sleep") as mock_sleep, \
+                patch("time.time", return_value=time.time() + 3 * 86400):
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._on_countdown_tick()
+            mock_sleep.assert_not_called()
+        w.close()
+
+    def test_populate_not_deferred_forever_by_stuck_scroller(
+            self, sample_favourite, sample_departure):
+        from PyQt5.QtWidgets import QScroller
+        home = HomeScreen()
+        dep_map = {f"{sample_favourite.stop_area_id}_{sample_favourite.line_id}_"
+                   f"{sample_favourite.direction}": [sample_departure]}
+        fake = MagicMock()
+        fake.state.return_value = QScroller.Pressed  # lost touch release
+        with patch("widgets.QScroller.scroller", return_value=fake):
+            home.populate([sample_favourite], dep_map)
+            home._apply_pending_populate()  # first retry: starts the clock
+            assert home.groups == []  # deferred while "pressed"
+            home._populate_deferred_since -= HomeScreen.POPULATE_MAX_DEFER_S + 1
+            home._apply_pending_populate()
+        assert len(home.groups) == 1
+        fake.stop.assert_called()
+
+
+class TestSearchErrorFlag:
+    @patch("main.load_favourites", return_value=[])
+    def test_stale_search_error_does_not_swallow_results(self, mock_load):
+        from main import MainWindow
+        w = MainWindow()
+        s = w.search
+        s._search_id = 2
+        s.stack.setCurrentIndex(1)
+        w._on_search_error("Erreur recherche: timeout", 1, s._search_id)  # stale
+        s.on_line_results([], 1)  # stale finished
+        assert not s._had_error
+        line = LineAtStop("C02000", "259", "bus")
+        s.on_line_results([line], 2)
+        assert s.line_loading.text() == ""
+        w.close()
+
+    def test_reset_clears_error_flag(self):
+        s = SearchScreen()
+        s._had_error = True
+        s.reset()
+        assert not s._had_error

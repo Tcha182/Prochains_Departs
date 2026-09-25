@@ -77,6 +77,9 @@ else
     sudo -u "$PI_USER" git clone "$REPO_URL" "$APP_DIR"
 fi
 
+echo "==> Hardening network (WiFi power save, reconnects, watchdog)..."
+bash "$APP_DIR/pi-network-setup.sh"
+
 echo "==> Creating placeholder .env..."
 if [ ! -f "$APP_DIR/.env" ]; then
     cat > "$APP_DIR/.env" << 'DOTENV'
@@ -212,3 +215,4 @@ echo "  - App starts automatically on the touchscreen"
 echo "  - Update with: ssh pi@<ip> 'cd /home/pi/app && ./update.sh'"
 echo "  - OS security updates install daily, auto-reboot at 4am if needed"
 echo "  - Hardware watchdog reboots the Pi if it ever freezes"
+echo "  - Network watchdog restarts WiFi (or reboots) if the network drops"

@@ -683,5 +683,10 @@ def start_worker(worker, parent=None):
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
+    # Free both once done: parented threads were otherwise kept forever,
+    # leaking one QThread (+ worker) per refresh on a kiosk that runs
+    # for weeks.
+    thread.finished.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
     thread.start()
     return thread, worker
