@@ -38,6 +38,12 @@ NOCTURNAL_START_HOUR = 2
 NOCTURNAL_END_HOUR = 5
 NOCTURNAL_SLEEP_MINUTES = 2  # idle time before the night screen kicks in
 HEARTBEAT_MS = 30 * 1000  # watchdog ping + nocturnal auto-wake check
+# A departure fetch still running after this long is considered stuck: a new
+# refresh may start and the stuck one's late results are ignored.
+REFRESH_STALL_SECONDS = 90
+# No successful departure fetch for this long while awake: restart the app
+# (systemd's Restart=always relaunches it) to shed any bad in-process state.
+SELF_RESTART_AFTER_SECONDS = 15 * 60
 
 log = logging.getLogger("departs.main")
 
@@ -85,7 +91,10 @@ class MainWindow(QMainWindow):
         self._active_threads = []  # prevent GC of running threads
         self._active_workers = []  # prevent GC of running workers
         self._settings = load_settings()
-        self._last_interaction_time = time.time()
+        # Monotonic, not wall-clock: the Pi has no RTC, so NTP can jump the
+        # clock by hours/days after boot, which made idle time look huge
+        # (instant sleep) or negative (never sleeping).
+        self._last_interaction_time = time.monotonic()
         self._sleeping = False
         self._nocturnal_sleep = False
 
@@ -106,7 +115,7 @@ class MainWindow(QMainWindow):
         # Home screen (index 0)
         self.home = HomeScreen()
         self.home.add_requested.connect(self._show_search)
-        self.home.refresh_requested.connect(self._refresh_departures)
+        self.home.refresh_requested.connect(lambda: self._refresh_departures(force=True))
         self.home.edit_toggled.connect(self._rebuild_home)
         self.home.settings_requested.connect(self._show_settings)
         self.stack.addWidget(self.home)
@@ -158,6 +167,12 @@ class MainWindow(QMainWindow):
         self._last_refresh_time = None
         self._next_refresh_epoch = None
         self._departure_error_msg = None
+        # Only the latest departure fetch may update the display; an older
+        # one finishing late (slow network) must not overwrite it.
+        self._departure_generation = 0
+        self._departure_started_at = None  # monotonic; None when idle
+        self._last_departure_success = time.monotonic()
+        self._departure_failures = 0
 
         # Countdown timer (1 second)
         self.countdown_timer = QTimer(self)
@@ -204,7 +219,7 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):
         if event.type() in (QEvent.MouseButtonPress, QEvent.MouseMove,
                             QEvent.TouchBegin, QEvent.TouchUpdate):
-            self._last_interaction_time = time.time()
+            self._last_interaction_time = time.monotonic()
         return super().eventFilter(obj, event)
 
     # ── Navigation ───────────────────────────────────────────────────────────
@@ -234,7 +249,7 @@ class MainWindow(QMainWindow):
         self.favourites.append(fav)
         save_favourites(self.favourites)
         self._show_home()
-        self._refresh_departures()
+        self._refresh_departures(force=True)
 
     def _delete_favourite(self, fav: Favourite):
         self.favourites = [
@@ -266,18 +281,46 @@ class MainWindow(QMainWindow):
 
     # ── Departure fetching ───────────────────────────────────────────────────
 
-    def _refresh_departures(self):
+    def _refresh_departures(self, force: bool = False):
+        """Start a departure fetch. `force` supersedes one already running
+        (user-initiated refreshes, new favourite, wake-up)."""
         if not self.favourites:
             self._rebuild_home()
             return
 
+        # One fetch at a time: on a slow network, stacking a new fetch every
+        # minute only piles up threads. A fetch stuck past the stall limit
+        # is abandoned (its late results are dropped by the generation check).
+        if self._departure_started_at is not None and not force:
+            running = time.monotonic() - self._departure_started_at
+            if running < REFRESH_STALL_SECONDS:
+                return
+            log.warning("departure fetch stuck for %.0fs, starting a new one", running)
+
+        self._departure_generation += 1
+        generation = self._departure_generation
+        self._departure_started_at = time.monotonic()
         self._departure_error_msg = None
-        self._launch_worker(DepartureWorker(list(self.favourites)),
-                            self._on_departures_received,
-                            on_error=self._on_departure_error)
+        self._launch_worker(
+            DepartureWorker(list(self.favourites)),
+            lambda dep_map, g=generation: self._on_departures_received(dep_map, g),
+            on_error=lambda msg, g=generation: self._on_departure_error(msg, g))
         self.home.set_updated_time("Mise a jour...")
 
-    def _on_departures_received(self, dep_map: dict):
+    def _on_departures_received(self, dep_map: dict, generation: int = None):
+        if generation is not None and generation != self._departure_generation:
+            return  # superseded by a newer fetch
+        self._departure_started_at = None
+        if dep_map or not self._departure_error_msg:
+            if self._departure_failures:
+                log.info("departures back after %d failed refresh(es)",
+                         self._departure_failures)
+            self._departure_failures = 0
+            self._last_departure_success = time.monotonic()
+        else:
+            self._departure_failures += 1
+        if self._sleeping:
+            return  # fetch finished after we went to sleep: keep the screen clear
         self.departure_map.update(dep_map)
         self._last_refresh_time = datetime.now()
         self._next_refresh_epoch = self._last_refresh_time.timestamp() + AUTO_REFRESH_MS / 1000
@@ -291,9 +334,12 @@ class MainWindow(QMainWindow):
             )
         self._rebuild_home()
 
-    def _on_departure_error(self, msg: str):
+    def _on_departure_error(self, msg: str, generation: int = None):
+        if generation is not None and generation != self._departure_generation:
+            return
         self._departure_error_msg = msg
-        self.home.set_updated_time(msg)
+        if not self._sleeping:
+            self.home.set_updated_time(msg)
 
     @staticmethod
     def _is_nocturnal() -> bool:
@@ -334,19 +380,39 @@ class MainWindow(QMainWindow):
             home_only = True
         if (effective_delay > 0 and not self._sleeping
                 and (not home_only or self.stack.currentIndex() == 0)):
-            idle = time.time() - self._last_interaction_time
+            idle = time.monotonic() - self._last_interaction_time
             if idle > effective_delay * 60:
                 self._enter_sleep()
 
     def _on_heartbeat(self):
         """Runs every 30s, including during sleep."""
         sd_notify("WATCHDOG=1")
+        self._check_refresh_health()
         # Auto-wake from a forced nocturnal sleep: users who disabled sleep
         # expect an always-on display, so don't require a tap at 5am.
         if (self._sleeping and self._nocturnal_sleep
                 and not self._is_nocturnal()):
             log.info("nocturnal pause over, waking display")
             self._wake_up()
+
+    def _check_refresh_health(self):
+        """Self-heal when departures haven't refreshed for a long time.
+
+        Rebooting the Pi used to be the only way out of a state where
+        refreshes silently stopped. Exiting lets systemd (Restart=always)
+        relaunch a fresh process; the network itself is looked after by
+        network-watchdog.sh (see pi-network-setup.sh).
+        """
+        if (not self.favourites or self._sleeping or self._is_nocturnal()):
+            # No refresh is expected: don't count this time as a failure.
+            self._last_departure_success = time.monotonic()
+            return
+        stale = time.monotonic() - self._last_departure_success
+        if stale > SELF_RESTART_AFTER_SECONDS:
+            log.error("no successful departure refresh for %.0f min "
+                      "(%d failed attempts), restarting app",
+                      stale / 60, self._departure_failures)
+            QApplication.instance().exit(1)
 
     # ── Sleep mode ───────────────────────────────────────────────────────────
 
@@ -370,13 +436,13 @@ class MainWindow(QMainWindow):
         log.info("waking up")
         self._sleeping = False
         self._nocturnal_sleep = False
-        self._last_interaction_time = time.time()
+        self._last_interaction_time = time.monotonic()
         self.home.set_updated_time("Chargement...")
         self.sleep_overlay.hide()
         self.refresh_timer.start()
         self.countdown_timer.start()
         self._set_backlight(True)
-        self._refresh_departures()
+        self._refresh_departures(force=True)
 
     def _set_backlight(self, on: bool):
         """Control Raspberry Pi backlight via sysfs. Silently fails on non-Pi."""
@@ -428,7 +494,8 @@ class MainWindow(QMainWindow):
         search_id = self.search._search_id
         self._launch_worker(LineSearchWorker(query, mode, search_id),
                             self.search.on_line_results,
-                            on_error=self.search.show_error)
+                            on_error=lambda msg, sid=search_id: self._on_search_error(
+                                msg, sid, self.search._search_id))
 
     def _on_stops_on_line(self, route_id: str):
         self._launch_worker(StopsOnLineWorker(route_id),
@@ -443,7 +510,15 @@ class MainWindow(QMainWindow):
     def _on_stop_area_search(self, query: str, search_id: int):
         self._launch_worker(StopAreaSearchWorker(query, search_id),
                             self.search.on_stop_area_results,
-                            on_error=self.search.show_error)
+                            on_error=lambda msg, sid=search_id: self._on_search_error(
+                                msg, sid, self.search._stop_search_id))
+
+    def _on_search_error(self, msg: str, search_id: int, current_id: int):
+        """Drop errors from superseded searches: their stale `finished` is
+        ignored too, so the error flag would otherwise swallow the results
+        of the current search (typing fast on a flaky network)."""
+        if search_id == current_id:
+            self.search.show_error(msg)
 
     def _on_line_details(self, line_ids: list):
         self._launch_worker(LineDetailsWorker(line_ids),

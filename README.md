@@ -117,6 +117,8 @@ The Pi is fully autonomous:
 - App updates daily at 3:30am from GitHub (only restarts if code changed)
 - OS security updates install daily, auto-reboot at 4am if needed
 - Hardware watchdog reboots the Pi if it freezes
+- Network hardening (`pi-network-setup.sh`): WiFi power saving off, WiFi reconnects forever, and a network watchdog (every 2 min) that restarts NetworkManager when the IDFM APIs are unreachable, or reboots if the local network stays down ~10 min
+- The app restarts itself if departures haven't refreshed for 15 min while awake
 
 ### Updating the app
 
@@ -129,6 +131,13 @@ To update manually via SSH:
 ```bash
 ssh pi@prochains-departs.local
 cd /home/pi/app && ./update.sh
+```
+
+**Pi set up before the network hardening?** Run it once (idempotent):
+
+```bash
+ssh pi@prochains-departs.local
+cd /home/pi/app && git pull && sudo ./pi-network-setup.sh
 ```
 
 Note: the systemd unit is written once at setup time. To pick up unit changes
@@ -148,6 +157,7 @@ Note: the systemd unit is written once at setup time. To pick up unit changes
 ├── MaterialIcons-Regular.ttf     Material Icons font (Google)
 ├── test_app.py                   Test suite
 ├── setup-pi.sh                   Pi setup script (packages, systemd, watchdog, timezone)
+├── pi-network-setup.sh           Network hardening (WiFi power save off, network watchdog)
 ├── prepare-sd.ps1                Windows script to prepare SD card for autonomous setup
 ├── update.sh                     Created on the Pi by setup-pi.sh — pulls code and restarts
 └── .env                          API token (not committed)

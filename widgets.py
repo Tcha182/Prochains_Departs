@@ -294,11 +294,14 @@ class HomeScreen(QWidget):
     edit_toggled = pyqtSignal()
     settings_requested = pyqtSignal()
 
+    POPULATE_MAX_DEFER_S = 5.0
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.edit_mode = False
         self.groups = []
         self._pending_populate = None
+        self._populate_deferred_since = None  # monotonic time of first deferral
         self._populate_retry = QTimer(self)
         self._populate_retry.setSingleShot(True)
         self._populate_retry.setInterval(250)
@@ -392,6 +395,9 @@ class HomeScreen(QWidget):
 
         Deferred while a touch scroll gesture is in flight: tearing the
         widgets out from under the finger kills the gesture mid-scroll.
+        The deferral is capped (POPULATE_MAX_DEFER_S): if the touchscreen
+        loses a release, QScroller stays "pressed" forever, and the list
+        used to never refresh again until a reboot.
         """
         self._pending_populate = (list(favourites), dict(departure_map), delete_callback)
         scroller = QScroller.scroller(self.scroll.viewport())
@@ -403,14 +409,21 @@ class HomeScreen(QWidget):
     def _apply_pending_populate(self):
         if self._pending_populate is None:
             return
-        favourites, departure_map, delete_callback = self._pending_populate
-        self._pending_populate = None
-
         scroller = QScroller.scroller(self.scroll.viewport())
         if scroller.state() != QScroller.Inactive:
-            self._pending_populate = (favourites, departure_map, delete_callback)
-            self._populate_retry.start()
-            return
+            now = time.monotonic()
+            if self._populate_deferred_since is None:
+                self._populate_deferred_since = now
+            if now - self._populate_deferred_since < self.POPULATE_MAX_DEFER_S:
+                self._populate_retry.start()
+                return
+            # Gesture stuck (lost touch release): reset it and rebuild anyway.
+            scroller.stop()
+        self._populate_deferred_since = None
+        self._populate_retry.stop()
+
+        favourites, departure_map, delete_callback = self._pending_populate
+        self._pending_populate = None
 
         scroll_pos = self.scroll.verticalScrollBar().value()
 
@@ -1050,7 +1063,9 @@ class SearchScreen(QWidget):
         self._clear_layout(self.line_results_layout)
         self.line_step_title.setText(TRANSPORT_MODE_LABELS.get(mode, mode))
         self._navigate(1)
-        # Load all lines for this mode immediately
+        # Load all lines for this mode immediately (new id: any typed search
+        # still in flight is now stale)
+        self._search_id += 1
         self.line_search_requested.emit("", mode)
 
     # ── Step 2: Line search ──
@@ -1546,6 +1561,7 @@ class SearchScreen(QWidget):
         self._resolved_stop_area_id = ""
         self._resolved_stop_name = ""
         self._nav_history.clear()
+        self._had_error = False
         self._debounce_timer.stop()
         self._stop_debounce_timer.stop()
         self.search_input.clear()
