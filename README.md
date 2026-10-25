@@ -7,12 +7,16 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 ## Features
 
 - **Two search flows**: by stop name, or by transport type (Bus, Metro, Tramway, Train/RER) then line
-- **Direction filtering**: Choose which direction to monitor at each stop
+- **Direction filtering**: Choose which direction to monitor at each stop (branches of the same line, e.g. RER B to Robinson / Saint-Remy, are kept apart)
+- **Traffic info**: Current disruptions for each favourite's line, refreshed every 5 minutes
+- **Clock**: Time and date in the home screen header
 - **Live countdowns**: Updated every second from SIRI Lite real-time data, computed against the server clock (immune to Pi clock drift)
-- **Favourites**: Saved locally with atomic writes (crash-safe)
+- **Favourites**: Saved locally with atomic writes (crash-safe); reorder them with the arrows in edit mode. An unreadable `favourites.json` is kept aside as `favourites.json.corrupt-<date>` instead of being overwritten
+- **Clear status**: Cancelled trains show "Annule" instead of a countdown; a stop whose last refresh failed is flagged "Donnees non actualisees"
 - **Auto-refresh**: Every 1 minute, stops fetched in parallel (pauses 2am-5am)
 - **Touch-optimised**: 800x480 layout with kinetic scrolling, tap feedback, and virtual AZERTY keyboard with an accent/symbol layer
-- **Settings screen**: API token, WiFi configuration, theme, sleep delay
+- **Settings screen**: API token, WiFi configuration, theme, sleep delay, evening brightness
+- **Evening dimming**: Backlight lowered to 50 % (or 25 %, or off) between 21h and 7h
 - **WiFi configuration**: Scan and connect to networks via nmcli
 - **Dark/light theme**: Toggle between themes in settings
 - **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake
@@ -25,8 +29,8 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 | File | Role |
 |---|---|
 | `main.py` | Entry point, MainWindow, timers, navigation, sleep mode |
-| `widgets.py` | UI widgets (HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard) |
-| `api.py` | QThread-based API workers (SIRI Lite, IDFM Open Data, WiFi) |
+| `widgets/` | UI widgets, one module per screen: `home.py`, `search.py`, `settings.py`, `keyboard.py`, plus shared touch helpers in `common.py` |
+| `api.py` | QThread-based API workers (SIRI Lite departures and traffic info, IDFM Open Data, WiFi) |
 | `models.py` | Dataclasses, shared helpers, JSON persistence (atomic writes) |
 | `styles.py` | QSS theme stylesheets and Material Icons helpers |
 
@@ -37,7 +41,7 @@ API workers run on background `QThread`s with catch-all error handling to preven
 - Python 3.10+
 - PyQt5
 - `requests`, `python-dotenv`
-- An [IDFM PRIM API key](https://prim.iledefrance-mobilites.fr/)
+- An [IDFM PRIM API key](https://prim.iledefrance-mobilites.fr/). For traffic info, also subscribe the key to PRIM's *Messages Info Trafic* (SIRI Lite general-message) API; without it the app works the same, just without disruption messages
 
 ## Local Setup
 
@@ -50,7 +54,7 @@ API_TOKEN=your-idfm-api-token
 2. Install dependencies:
 
 ```bash
-pip install PyQt5 requests python-dotenv
+pip install -r requirements.txt
 ```
 
 3. Run:
@@ -62,9 +66,10 @@ python main.py
 ## Testing
 
 ```bash
-pip install pytest
-pytest test_app.py -v -m "not live"
+QT_QPA_PLATFORM=offscreen pytest test_app.py -v -m "not live"
 ```
+
+These run on GitHub Actions for every push to `main` and every pull request (`.github/workflows/tests.yml`).
 
 Live integration tests (require network + valid API key):
 
@@ -150,12 +155,14 @@ Note: the systemd unit is written once at setup time. To pick up unit changes
 ```
 .
 ├── main.py                       App entry point
-├── widgets.py                    PyQt5 UI widgets
+├── widgets/                      PyQt5 UI widgets (home, search, settings, keyboard)
 ├── api.py                        API workers (SIRI Lite, IDFM Open Data, WiFi)
 ├── models.py                     Dataclasses and persistence
 ├── styles.py                     QSS stylesheets + icon helpers
 ├── MaterialIcons-Regular.ttf     Material Icons font (Google)
 ├── test_app.py                   Test suite
+├── requirements.txt              Python dependencies
+├── .github/workflows/tests.yml   CI: lint + unit tests
 ├── setup-pi.sh                   Pi setup script (packages, systemd, watchdog, timezone)
 ├── pi-network-setup.sh           Network hardening (WiFi power save off, network watchdog)
 ├── prepare-sd.ps1                Windows script to prepare SD card for autonomous setup
