@@ -4,6 +4,7 @@ Entry point: MainWindow with auto-refresh, countdown interpolation, and favourit
 """
 
 import glob
+from functools import partial
 import logging
 import logging.handlers
 import os
@@ -23,7 +24,7 @@ from models import (
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
     ResolveAndProbeWorker, StopAreaSearchWorker, LineDetailsWorker,
-    WiFiScanWorker, WiFiConnectWorker, UpdateWorker,
+    WiFiScanWorker, WiFiConnectWorker, UpdateWorker, TrafficWorker,
     start_worker,
 )
 from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard
@@ -37,6 +38,7 @@ KEYBOARD_HEIGHT = 220
 NOCTURNAL_START_HOUR = 2
 NOCTURNAL_END_HOUR = 5
 NOCTURNAL_SLEEP_MINUTES = 2  # idle time before the night screen kicks in
+TRAFFIC_REFRESH_MS = 5 * 60 * 1000  # disruptions change slowly
 HEARTBEAT_MS = 30 * 1000  # watchdog ping + nocturnal auto-wake check
 # A departure fetch still running after this long is considered stuck: a new
 # refresh may start and the stuck one's late results are ignored.
@@ -90,6 +92,7 @@ class MainWindow(QMainWindow):
         self.departure_map = {}  # {fav_key: [Departure, ...]}
         self._active_threads = []  # prevent GC of running threads
         self._active_workers = []  # prevent GC of running workers
+        self._closed = False
         self._settings = load_settings()
         # Monotonic, not wall-clock: the Pi has no RTC, so NTP can jump the
         # clock by hours/days after boot, which made idle time look huge
@@ -111,6 +114,7 @@ class MainWindow(QMainWindow):
         if self.favourites:
             self.home.set_updated_time("Chargement...")
             QTimer.singleShot(500, self._refresh_departures)
+            QTimer.singleShot(1500, self._refresh_traffic)
 
     def _setup_ui(self):
         self.stack = QStackedWidget()
@@ -177,6 +181,13 @@ class MainWindow(QMainWindow):
         self._departure_started_at = None  # monotonic; None when idle
         self._last_departure_success = time.monotonic()
         self._departure_failures = 0
+
+        # Traffic info timer (stopped during sleep, like the refresh timer)
+        self.traffic_timer = QTimer(self)
+        self.traffic_timer.setInterval(TRAFFIC_REFRESH_MS)
+        self.traffic_timer.timeout.connect(self._refresh_traffic)
+        self.traffic_timer.start()
+        self._traffic_running = False
 
         # Countdown timer (1 second)
         self.countdown_timer = QTimer(self)
@@ -251,6 +262,7 @@ class MainWindow(QMainWindow):
         save_favourites(self.favourites)
         self._show_home()
         self._refresh_departures(force=True)
+        self._refresh_traffic()
 
     def _delete_favourite(self, fav: Favourite):
         self.favourites = [f for f in self.favourites if f.key != fav.key]
@@ -280,15 +292,31 @@ class MainWindow(QMainWindow):
 
     # ── Worker lifecycle ─────────────────────────────────────────────────────
 
+    def closeEvent(self, event):
+        """Stop timers and let running workers finish, so no thread is
+        destroyed while still running (Qt aborts the process if it is)."""
+        self._closed = True
+        for timer in (self.refresh_timer, self.traffic_timer,
+                      self.countdown_timer, self.heartbeat_timer):
+            timer.stop()
+        for thread in list(self._active_threads):
+            thread.quit()
+            thread.wait(3000)
+        super().closeEvent(event)
+
     def _launch_worker(self, worker, on_finished, on_error=None):
         """Wire up a worker's signals, move it to a thread, and start it."""
+        if self._closed:
+            return  # a delayed call firing after close
         worker.finished.connect(on_finished)
         if on_error is not None and hasattr(worker, "error"):
             worker.error.connect(on_error)
         thread, worker = start_worker(worker, self)
         self._active_threads.append(thread)
         self._active_workers.append(worker)
-        thread.finished.connect(lambda t=thread, w=worker: self._cleanup_worker(t, w))
+        # partial, not a lambda with default args: PyQt may call a lambda
+        # slot with the signal's arguments, which then replace the defaults.
+        thread.finished.connect(partial(self._cleanup_worker, thread, worker))
 
     # ── Departure fetching ───────────────────────────────────────────────────
 
@@ -353,6 +381,24 @@ class MainWindow(QMainWindow):
         self._departure_error_msg = msg
         if not self._sleeping:
             self.home.set_updated_time(msg)
+
+    # ── Traffic info ─────────────────────────────────────────────────────────
+
+    def _refresh_traffic(self):
+        if (not self.favourites or self._sleeping or self._is_nocturnal()
+                or self._traffic_running):
+            return
+        self._traffic_running = True
+        self._launch_worker(TrafficWorker([f.line_id for f in self.favourites]),
+                            self._on_traffic_received)
+
+    def _on_traffic_received(self, traffic: dict):
+        self._traffic_running = False
+        traffic = {line: msgs for line, msgs in traffic.items() if msgs}
+        if self._sleeping or traffic == self._traffic:
+            return  # nothing new: skip a rebuild (it resets touch state)
+        self._traffic = traffic
+        self._rebuild_home()
 
     @staticmethod
     def _is_nocturnal() -> bool:
@@ -435,6 +481,7 @@ class MainWindow(QMainWindow):
         self._nocturnal_sleep = (self._is_nocturnal()
                                  and self._settings.sleep_delay_minutes == 0)
         self.refresh_timer.stop()
+        self.traffic_timer.stop()
         self.countdown_timer.stop()
         # Clear stale departures so they aren't visible under the overlay
         self.departure_map.clear()
@@ -454,9 +501,11 @@ class MainWindow(QMainWindow):
         self.home.set_updated_time("Chargement...")
         self.sleep_overlay.hide()
         self.refresh_timer.start()
+        self.traffic_timer.start()
         self.countdown_timer.start()
         self._set_backlight(True)
         self._refresh_departures(force=True)
+        self._refresh_traffic()
 
     def _set_backlight(self, on: bool):
         """Control Raspberry Pi backlight via sysfs. Silently fails on non-Pi."""

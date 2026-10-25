@@ -27,7 +27,7 @@ from models import (
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
     ResolveAndProbeWorker, StopAreaSearchWorker, LineDetailsWorker,
-    start_worker,
+    start_worker, TrafficWorker,
 )
 from widgets import DepartureCard, FavouriteGroup, HomeScreen, SearchScreen
 from styles import DARK_THEME
@@ -36,6 +36,21 @@ from styles import DARK_THEME
 # ═══════════════════════════════════════════════════════════════════════════════
 # FIXTURES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+def no_network(request):
+    """Unit tests never reach the real APIs: a worker started in the
+    background (e.g. by a MainWindow timer) fails fast instead of holding a
+    thread open on a slow network. Tests patch api.requests.get themselves
+    to provide responses; live tests are left alone."""
+    if request.node.get_closest_marker("live"):
+        yield
+        return
+    import requests as _requests
+    with patch("api.requests.get",
+               side_effect=_requests.ConnectionError("network disabled in tests")):
+        yield
+
 
 @pytest.fixture
 def tmp_fav_path(tmp_path):
@@ -2345,3 +2360,75 @@ class TestHomeImprovements:
         home.update_clock(datetime(2026, 10, 25, 8, 5))
         assert home.header_clock.text() == "08:05"
         assert home.header_date.text() == "dimanche 25 octobre"
+
+
+def _general_message(messages, ts="2026-10-25T08:00:00Z"):
+    return {"Siri": {"ServiceDelivery": {
+        "ResponseTimestamp": ts,
+        "GeneralMessageDelivery": [{"InfoMessage": messages}]}}}
+
+
+def _info(text, channel="Perturbation", until="2026-10-25T20:00:00Z",
+          msg_type="SHORT_MESSAGE"):
+    return {"InfoChannelRef": {"value": channel}, "ValidUntilTime": until,
+            "Content": {"Message": [{"MessageType": msg_type,
+                                     "MessageText": {"value": text}}]}}
+
+
+class TestTrafficWorker:
+    def test_keeps_current_perturbations_only(self):
+        data = _general_message([
+            _info("Trafic interrompu entre A et B"),
+            _info("Nouveau: abonnement", channel="Commercial"),
+            _info("Travaux termines", until="2026-10-24T20:00:00Z"),
+            _info("Trafic interrompu entre A et B"),  # duplicate
+        ])
+        assert TrafficWorker.parse(data, 0) == ["Trafic interrompu entre A et B"]
+
+    def test_prefers_short_message_and_strips_html(self):
+        info = _info("<p>Long <b>texte</b></p>", msg_type="LONG_MESSAGE")
+        info["Content"]["Message"].append(
+            {"MessageType": "SHORT_MESSAGE", "MessageText": {"value": "Court"}})
+        assert TrafficWorker.parse(_general_message([info]), 0) == ["Court"]
+        only_long = _info("<p>Long  <b>texte</b></p>", msg_type="LONG_MESSAGE")
+        assert TrafficWorker.parse(_general_message([only_long]), 0) == ["Long texte"]
+
+    def test_truncates_and_caps_count(self):
+        data = _general_message([_info("x" * 500), _info("b"), _info("c")])
+        msgs = TrafficWorker.parse(data, 0)
+        assert len(msgs) == 2
+        assert len(msgs[0]) == TrafficWorker.MAX_CHARS
+
+    def test_empty_or_odd_payloads(self):
+        assert TrafficWorker.parse({}, 0) == []
+        assert TrafficWorker.parse({"Siri": {"ServiceDelivery": {
+            "GeneralMessageDelivery": [{}]}}}, 0) == []
+
+    @patch("api.requests.get")
+    def test_failed_line_is_left_out(self, mock_get):
+        import requests as _requests
+        ok = MagicMock()
+        ok.raise_for_status = MagicMock()
+        ok.json.return_value = _general_message([_info("Panne")])
+        bad = MagicMock()
+        bad.raise_for_status.side_effect = _requests.HTTPError("403")
+        mock_get.side_effect = [ok, bad]
+        worker = TrafficWorker(["L1", "L2", "L1"])
+        out = {}
+        worker.finished.connect(out.update)
+        worker.run()
+        assert out == {"L1": ["Panne"]}
+        assert mock_get.call_count == 2  # duplicates fetched once
+
+    @patch("main.load_favourites")
+    @patch("main.save_favourites")
+    def test_main_window_shows_traffic(self, mock_save, mock_load):
+        from main import MainWindow
+        fav = Favourite("1", "A", "C01742", "A")
+        mock_load.return_value = [fav]
+        w = MainWindow()
+        w._on_traffic_received({"C01742": ["Trafic perturbe"], "X": []})
+        assert w._traffic == {"C01742": ["Trafic perturbe"]}
+        _app.processEvents()
+        assert len(w.home.groups[0].traffic_labels) == 1
+        w.close()
