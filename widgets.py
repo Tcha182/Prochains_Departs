@@ -444,7 +444,7 @@ class HomeScreen(QWidget):
             return
 
         for fav in favourites:
-            fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
+            fav_key = fav.key
             departures = departure_map.get(fav_key, [])
             group = FavouriteGroup(fav, departures, edit_mode=self.edit_mode)
             if delete_callback:

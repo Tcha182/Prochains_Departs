@@ -175,6 +175,28 @@ class TestPersistence:
         assert len(loaded) == 2
         assert loaded[1].line_color == "FF0000"
 
+    def test_corrupt_file_is_kept_aside(self, tmp_path):
+        """A corrupt file must not be silently overwritten by the next save."""
+        path = str(tmp_path / "favourites.json")
+        with open(path, "w") as f:
+            f.write("NOT JSON{{{")
+        with patch("models.FAVOURITES_PATH", path):
+            assert load_favourites() == []
+            save_favourites([Favourite("1", "A", "L1", "1")])
+        backups = [n for n in os.listdir(tmp_path) if ".corrupt-" in n]
+        assert len(backups) == 1
+        with open(tmp_path / backups[0]) as f:
+            assert f.read() == "NOT JSON{{{"
+
+    def test_unknown_fields_are_ignored(self, tmp_path):
+        path = str(tmp_path / "favourites.json")
+        with open(path, "w") as f:
+            json.dump([{"stop_area_id": "1", "stop_name": "A", "line_id": "L",
+                        "line_name": "1", "future_field": True}], f)
+        with patch("models.FAVOURITES_PATH", path):
+            loaded = load_favourites()
+        assert loaded[0].stop_name == "A"
+
     def test_unicode_persistence(self, tmp_fav_path):
         fav = Favourite("1", "Pavillon Halévy", "L1", "259", destination_name="Saint-Germain-en-Laye <RER>")
         with patch("models.FAVOURITES_PATH", tmp_fav_path):
@@ -289,8 +311,8 @@ class TestDepartureWorkerRun:
         assert mock_get.call_count == 1
 
         # Each favourite gets its own filtered departures
-        key1 = f"50980_C02000_{fav1.direction}"
-        key2 = f"50980_C02000_{fav2.direction}"
+        key1 = fav1.key
+        key2 = fav2.key
         assert key1 in results
         assert key2 in results
         # Saint-Germain favourite gets Saint-Germain departure
@@ -327,7 +349,7 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = f"50980_C02000_{sample_favourite.direction}"
+        key = sample_favourite.key
         assert len(results[key]) <= 5
 
     @patch("api.requests.get")
@@ -353,7 +375,7 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = "50980_C02000_1"
+        key = fav.key
         assert len(results[key]) == 1
         assert results[key][0].destination == "Saint-Germain"
 
@@ -380,8 +402,38 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = "50980_C02000_"
+        key = fav.key
         assert len(results[key]) == 2
+
+    @patch("api.requests.get")
+    def test_branches_sharing_a_direction_stay_separate(self, mock_get):
+        """RER B: Robinson and Saint-Remy share DirectionRef; each favourite
+        must keep its own departures."""
+        now = datetime.now(timezone.utc)
+        t1 = (now + timedelta(minutes=3)).isoformat()
+        t2 = (now + timedelta(minutes=6)).isoformat()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = make_siri_response([
+            {"destination": "Robinson", "expected_time": t1, "direction_ref": "A"},
+            {"destination": "Saint-Remy-les-Chevreuse", "expected_time": t2,
+             "direction_ref": "A"},
+        ])
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+        fav_r = Favourite("1", "Gare du Nord", "C01743", "B",
+                          direction="A", destination_name="Robinson")
+        fav_s = Favourite("1", "Gare du Nord", "C01743", "B",
+                          direction="A", destination_name="Saint-Remy-les-Chevreuse")
+        assert fav_r.key != fav_s.key
+
+        worker = DepartureWorker([fav_r, fav_s])
+        results = {}
+        worker.finished.connect(lambda r: results.update(r))
+        worker.run()
+
+        assert [d.destination for d in results[fav_r.key]] == ["Robinson"]
+        assert [d.destination for d in results[fav_s.key]] == [
+            "Saint-Remy-les-Chevreuse"]
 
     @patch("api.requests.get")
     def test_run_filters_terminus_arrivals(self, mock_get):
@@ -408,7 +460,7 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = "43114_C01742_1"
+        key = fav.key
         # Only "Marne-la-Vallee Chessy" should remain; both Saint-Germain variants filtered
         assert len(results[key]) == 1
         assert "Marne" in results[key][0].destination
@@ -844,13 +896,13 @@ class TestHomeScreen:
 
     def test_populate_with_favourites(self, sample_favourite, sample_departure):
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         home.populate([sample_favourite], dep_map)
         assert len(home.groups) == 1
 
     def test_populate_clears_old_groups(self, sample_favourite, sample_departure):
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         home.populate([sample_favourite], dep_map)
         assert len(home.groups) == 1
         # Populate again with empty
@@ -867,7 +919,7 @@ class TestHomeScreen:
 
     def test_edit_mode_shows_delete_buttons(self, sample_favourite, sample_departure):
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         # Normal mode - no delete buttons
         home.populate([sample_favourite], dep_map)
         group = home.groups[0]
@@ -910,7 +962,7 @@ class TestHomeScreen:
     def test_repopulate_empty_after_populated(self, sample_favourite, sample_departure):
         """Verify we can go from populated -> empty -> populated without crash."""
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         home.populate([sample_favourite], dep_map)
         assert len(home.groups) == 1
 
@@ -1328,7 +1380,7 @@ class TestMainWindow:
         w = MainWindow()
         dep = Departure("259", "X", "Saint-Germain", "",
                         fetch_timestamp=time.time(), eta_seconds=300)
-        w.departure_map = {"50980_C02000_1": [dep]}
+        w.departure_map = {fav.key: [dep]}
         w._rebuild_home()
 
         # Normal mode: no delete buttons
@@ -1404,7 +1456,7 @@ class TestLiveAPIs:
         results = {}
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
-        key = "50980_C02000_1"
+        key = fav.key
         assert key in results
         # May be empty during night, but key should exist
 
@@ -2148,8 +2200,7 @@ class TestRefreshRobustness:
             self, sample_favourite, sample_departure):
         from PyQt5.QtWidgets import QScroller
         home = HomeScreen()
-        dep_map = {f"{sample_favourite.stop_area_id}_{sample_favourite.line_id}_"
-                   f"{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         fake = MagicMock()
         fake.state.return_value = QScroller.Pressed  # lost touch release
         with patch("widgets.QScroller.scroller", return_value=fake):

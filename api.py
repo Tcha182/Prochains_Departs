@@ -167,7 +167,7 @@ class DepartureWorker(QObject):
             # Distribute departures to each favourite based on direction
             results = {}
             for fav in favs:
-                fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
+                fav_key = fav.key
                 stop_norm = normalize(fav.stop_name)
                 matched = [
                     d for d in all_departures

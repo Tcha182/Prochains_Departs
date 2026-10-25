@@ -239,12 +239,9 @@ class MainWindow(QMainWindow):
 
     def _on_favourite_added(self, fav: Favourite):
         # Avoid duplicates
-        for existing in self.favourites:
-            if (existing.stop_area_id == fav.stop_area_id
-                    and existing.line_id == fav.line_id
-                    and existing.destination_name == fav.destination_name):
-                self._show_home()
-                return
+        if any(existing.key == fav.key for existing in self.favourites):
+            self._show_home()
+            return
 
         self.favourites.append(fav)
         save_favourites(self.favourites)
@@ -252,16 +249,9 @@ class MainWindow(QMainWindow):
         self._refresh_departures(force=True)
 
     def _delete_favourite(self, fav: Favourite):
-        self.favourites = [
-            f for f in self.favourites
-            if not (f.stop_area_id == fav.stop_area_id
-                    and f.line_id == fav.line_id
-                    and f.destination_name == fav.destination_name)
-        ]
+        self.favourites = [f for f in self.favourites if f.key != fav.key]
         save_favourites(self.favourites)
-        # Remove from departure map
-        fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
-        self.departure_map.pop(fav_key, None)
+        self.departure_map.pop(fav.key, None)
         self._rebuild_home()
 
     def _rebuild_home(self):
