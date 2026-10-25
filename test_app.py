@@ -2257,7 +2257,7 @@ class TestRefreshRobustness:
         dep_map = {sample_favourite.key: [sample_departure]}
         fake = MagicMock()
         fake.state.return_value = QScroller.Pressed  # lost touch release
-        with patch("widgets.QScroller.scroller", return_value=fake):
+        with patch("widgets.home.QScroller.scroller", return_value=fake):
             home.populate([sample_favourite], dep_map)
             home._apply_pending_populate()  # first retry: starts the clock
             assert home.groups == []  # deferred while "pressed"

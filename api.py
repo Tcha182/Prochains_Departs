@@ -13,7 +13,7 @@ from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from dotenv import load_dotenv
 
 from models import (
-    Favourite, Departure, LineAtStop, StopOnLine, StopAreaMatch,
+    Departure, LineAtStop, StopOnLine, StopAreaMatch,
     normalize, is_same_place,
 )
 

@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QStackedWidget, QLineEdit
 
 from models import (
     Favourite, load_favourites, save_favourites,
-    AppSettings, load_settings, save_settings, save_api_token,
+    load_settings, save_settings, save_api_token,
 )
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
@@ -28,7 +28,7 @@ from api import (
     start_worker,
 )
 from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard
-from styles import DARK_THEME, set_theme, get_theme, load_icon_font
+from styles import set_theme, load_icon_font
 
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 480
