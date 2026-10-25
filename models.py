@@ -128,6 +128,7 @@ def save_favourites(favourites: List[Favourite]) -> None:
 class AppSettings:
     theme: str = "dark"            # "dark" or "light"
     sleep_delay_minutes: int = 10  # 0 = disabled
+    evening_brightness: int = 50   # % of full backlight in the evening; 100 = no dimming
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 

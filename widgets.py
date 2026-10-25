@@ -584,6 +584,8 @@ class SleepOverlay(QWidget):
 
 SLEEP_OPTIONS = [5, 10, 30, 0]  # 0 = disabled
 SLEEP_LABELS = {5: "5 min", 10: "10 min", 30: "30 min", 0: "Desactive"}
+DIM_OPTIONS = [100, 50, 25]  # evening backlight, % of full
+DIM_LABELS = {100: "Desactive", 50: "50 %", 25: "25 %"}
 
 
 class SettingsScreen(QWidget):
@@ -596,11 +598,14 @@ class SettingsScreen(QWidget):
     wifi_connect_requested = pyqtSignal(str, str)  # ssid, password
     api_token_saved = pyqtSignal(str)
     update_check_requested = pyqtSignal()
+    evening_brightness_changed = pyqtSignal(int)
 
-    def __init__(self, current_theme: str = "dark", current_sleep: int = 10, parent=None):
+    def __init__(self, current_theme: str = "dark", current_sleep: int = 10,
+                 current_dim: int = 100, parent=None):
         super().__init__(parent)
         self._theme = current_theme
         self._sleep = current_sleep
+        self._dim = current_dim
         self._update_in_progress = False
         self._setup_ui()
 
@@ -669,6 +674,12 @@ class SettingsScreen(QWidget):
         self.sleep_row.tapped.connect(self._cycle_sleep)
         content_layout.addWidget(self.sleep_row)
 
+        # Evening dimming row
+        self.dim_row = self._make_settings_row(
+            "Luminosite le soir", DIM_LABELS.get(self._dim, f"{self._dim} %"))
+        self.dim_row.tapped.connect(self._cycle_dim)
+        content_layout.addWidget(self.dim_row)
+
         # Update row
         self.update_row = self._make_settings_row("Mise a jour", "Verifier")
         self.update_row.tapped.connect(self._on_check_update_pressed)
@@ -712,6 +723,15 @@ class SettingsScreen(QWidget):
         self._sleep = SLEEP_OPTIONS[(idx + 1) % len(SLEEP_OPTIONS)]
         self.sleep_row._value_label.setText(SLEEP_LABELS.get(self._sleep, f"{self._sleep} min"))
         self.sleep_delay_changed.emit(self._sleep)
+
+    def _cycle_dim(self):
+        try:
+            idx = DIM_OPTIONS.index(self._dim)
+        except ValueError:
+            idx = -1
+        self._dim = DIM_OPTIONS[(idx + 1) % len(DIM_OPTIONS)]
+        self.dim_row._value_label.setText(DIM_LABELS[self._dim])
+        self.evening_brightness_changed.emit(self._dim)
 
     def _on_check_update_pressed(self):
         if self._update_in_progress:

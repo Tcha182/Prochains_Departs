@@ -39,6 +39,9 @@ NOCTURNAL_START_HOUR = 2
 NOCTURNAL_END_HOUR = 5
 NOCTURNAL_SLEEP_MINUTES = 2  # idle time before the night screen kicks in
 TRAFFIC_REFRESH_MS = 5 * 60 * 1000  # disruptions change slowly
+# Evening: backlight dimmed to the evening_brightness setting.
+EVENING_START_HOUR = 21
+EVENING_END_HOUR = 7
 HEARTBEAT_MS = 30 * 1000  # watchdog ping + nocturnal auto-wake check
 # A departure fetch still running after this long is considered stuck: a new
 # refresh may start and the stuck one's late results are ignored.
@@ -105,9 +108,12 @@ class MainWindow(QMainWindow):
         self._stale_keys = set()
         self._traffic = {}  # {line_id: [perturbation text, ...]}
 
+        self._brightness_pct = None  # last applied backlight level
+
         self._setup_ui()
         self._setup_timers()
         self._detect_kiosk()
+        self._apply_brightness()
 
         # Show current state immediately, then fetch data
         self._rebuild_home()
@@ -143,6 +149,7 @@ class MainWindow(QMainWindow):
         self.settings_screen = SettingsScreen(
             current_theme=self._settings.theme,
             current_sleep=self._settings.sleep_delay_minutes,
+            current_dim=self._settings.evening_brightness,
         )
         self.settings_screen.back_to_home.connect(self._show_home)
         self.settings_screen.theme_changed.connect(self._on_theme_changed)
@@ -151,6 +158,8 @@ class MainWindow(QMainWindow):
         self.settings_screen.wifi_connect_requested.connect(self._on_wifi_connect)
         self.settings_screen.api_token_saved.connect(self._on_api_token_saved)
         self.settings_screen.update_check_requested.connect(self._on_check_update)
+        self.settings_screen.evening_brightness_changed.connect(
+            self._on_evening_brightness_changed)
         self.stack.addWidget(self.settings_screen)
 
         # Virtual keyboard (child widget, overlays at bottom)
@@ -447,6 +456,7 @@ class MainWindow(QMainWindow):
         """Runs every 30s, including during sleep."""
         sd_notify("WATCHDOG=1")
         self._check_refresh_health()
+        self._apply_brightness()
         # Auto-wake from a forced nocturnal sleep: users who disabled sleep
         # expect an always-on display, so don't require a tap at 5am.
         if (self._sleeping and self._nocturnal_sleep
@@ -517,7 +527,36 @@ class MainWindow(QMainWindow):
         except (OSError, PermissionError):
             pass
 
+    @staticmethod
+    def _is_evening() -> bool:
+        hour = datetime.now().hour
+        return hour >= EVENING_START_HOUR or hour < EVENING_END_HOUR
+
+    def _apply_brightness(self):
+        """Dim the backlight in the evening (a full-bright screen lights up
+        a dark room). Only writes when the level changes."""
+        pct = self._settings.evening_brightness if self._is_evening() else 100
+        pct = max(5, min(100, pct))  # never fully black: that's sleep's job
+        if pct == self._brightness_pct:
+            return
+        self._brightness_pct = pct
+        for device in glob.glob("/sys/class/backlight/*"):
+            try:
+                with open(os.path.join(device, "max_brightness")) as f:
+                    max_level = int(f.read().strip())
+                level = max(1, round(max_level * pct / 100))
+                with open(os.path.join(device, "brightness"), "w") as f:
+                    f.write(str(level))
+                log.info("backlight set to %d%% (%d/%d)", pct, level, max_level)
+            except (OSError, ValueError) as e:
+                log.warning("could not set backlight on %s: %s", device, e)
+
     # ── Settings handlers ────────────────────────────────────────────────────
+
+    def _on_evening_brightness_changed(self, pct: int):
+        self._settings.evening_brightness = pct
+        save_settings(self._settings)
+        self._apply_brightness()
 
     def _on_theme_changed(self, name: str):
         set_theme(name)

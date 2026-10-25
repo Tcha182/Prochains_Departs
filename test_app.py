@@ -2432,3 +2432,62 @@ class TestTrafficWorker:
         _app.processEvents()
         assert len(w.home.groups[0].traffic_labels) == 1
         w.close()
+
+
+class TestEveningDimming:
+    def _fake_backlight(self, tmp_path, max_level=255):
+        dev = tmp_path / "rpi_backlight"
+        dev.mkdir()
+        (dev / "max_brightness").write_text(f"{max_level}\n")
+        (dev / "brightness").write_text(f"{max_level}\n")
+        return dev
+
+    @patch("main.load_favourites", return_value=[])
+    def test_dims_in_evening_and_restores_by_day(self, mock_load, tmp_path):
+        from main import MainWindow
+        dev = self._fake_backlight(tmp_path)
+        with patch("main.glob.glob", return_value=[str(dev)]), \
+                patch("main.datetime") as mock_dt, \
+                patch("main.save_settings"):
+            mock_dt.now.return_value = MagicMock(hour=22)
+            w = MainWindow()
+            w._settings.evening_brightness = 50
+            w._brightness_pct = None
+            w._apply_brightness()
+            assert (dev / "brightness").read_text() == "128"
+
+            mock_dt.now.return_value = MagicMock(hour=10)
+            w._apply_brightness()
+            assert (dev / "brightness").read_text() == "255"
+
+            # Setting change applies straight away in the evening
+            mock_dt.now.return_value = MagicMock(hour=6)
+            w._on_evening_brightness_changed(25)
+            assert (dev / "brightness").read_text() == "64"
+            w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_writes_only_on_change(self, mock_load, tmp_path):
+        from main import MainWindow
+        dev = self._fake_backlight(tmp_path)
+        with patch("main.glob.glob", return_value=[str(dev)]), \
+                patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=12)
+            w = MainWindow()
+            w._brightness_pct = None
+            w._apply_brightness()
+            (dev / "brightness").write_text("7")  # changed behind our back
+            w._apply_brightness()  # same level: no write
+            assert (dev / "brightness").read_text() == "7"
+            w.close()
+
+    def test_settings_row_cycles(self):
+        from widgets import SettingsScreen
+        screen = SettingsScreen(current_dim=100)
+        got = []
+        screen.evening_brightness_changed.connect(got.append)
+        screen._cycle_dim()
+        screen._cycle_dim()
+        screen._cycle_dim()
+        assert got == [50, 25, 100]
+        assert screen.dim_row._value_label.text() == "Desactive"
