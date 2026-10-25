@@ -97,13 +97,17 @@ class MainWindow(QMainWindow):
         self._last_interaction_time = time.monotonic()
         self._sleeping = False
         self._nocturnal_sleep = False
+        # Favourites whose last refresh failed: their rows are from an
+        # earlier fetch and get flagged as such.
+        self._stale_keys = set()
+        self._traffic = {}  # {line_id: [perturbation text, ...]}
 
         self._setup_ui()
         self._setup_timers()
         self._detect_kiosk()
 
         # Show current state immediately, then fetch data
-        self.home.populate(self.favourites, self.departure_map, self._delete_favourite)
+        self._rebuild_home()
         if self.favourites:
             self.home.set_updated_time("Chargement...")
             QTimer.singleShot(500, self._refresh_departures)
@@ -254,8 +258,25 @@ class MainWindow(QMainWindow):
         self.departure_map.pop(fav.key, None)
         self._rebuild_home()
 
+    def _move_favourite(self, fav: Favourite, delta: int):
+        """Move a favourite up (-1) or down (+1) in the home list."""
+        keys = [f.key for f in self.favourites]
+        if fav.key not in keys:
+            return
+        i = keys.index(fav.key)
+        j = i + delta
+        if not 0 <= j < len(self.favourites):
+            return
+        self.favourites[i], self.favourites[j] = self.favourites[j], self.favourites[i]
+        save_favourites(self.favourites)
+        self._rebuild_home()
+
     def _rebuild_home(self):
-        self.home.populate(self.favourites, self.departure_map, self._delete_favourite)
+        self.home.populate(self.favourites, self.departure_map,
+                           self._delete_favourite,
+                           stale_keys=self._stale_keys,
+                           traffic=self._traffic,
+                           move_callback=self._move_favourite)
 
     # ── Worker lifecycle ─────────────────────────────────────────────────────
 
@@ -312,6 +333,8 @@ class MainWindow(QMainWindow):
         if self._sleeping:
             return  # fetch finished after we went to sleep: keep the screen clear
         self.departure_map.update(dep_map)
+        # A group whose fetch failed is simply absent from dep_map.
+        self._stale_keys = {f.key for f in self.favourites if f.key not in dep_map}
         self._last_refresh_time = datetime.now()
         self._next_refresh_epoch = self._last_refresh_time.timestamp() + AUTO_REFRESH_MS / 1000
         if not dep_map and self._departure_error_msg:
@@ -415,6 +438,7 @@ class MainWindow(QMainWindow):
         self.countdown_timer.stop()
         # Clear stale departures so they aren't visible under the overlay
         self.departure_map.clear()
+        self._stale_keys = set()
         self._rebuild_home()
         self.home.set_updated_time("")
         self.sleep_overlay.setGeometry(self.rect())

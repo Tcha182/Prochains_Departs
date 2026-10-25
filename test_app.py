@@ -611,6 +611,30 @@ class TestStopsOnLineWorker:
         assert len(errors) == 1
 
 
+class TestStopsOnLinePagination:
+    @patch("api.requests.get")
+    def test_fetches_every_page(self, mock_get):
+        """Lines with more than 100 stop records must not be cut off."""
+        def page(params):
+            offset = params["offset"]
+            n = 100 if offset < 200 else 30
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {"results": [
+                {"stop_name": f"Arret {offset + i:03d}", "stop_id": str(offset + i)}
+                for i in range(n)]}
+            return resp
+        mock_get.side_effect = lambda url, params, timeout: page(params)
+
+        worker = StopsOnLineWorker("IDFM:C01234")
+        results = []
+        worker.finished.connect(lambda r: results.extend(r))
+        worker.run()
+
+        assert mock_get.call_count == 3
+        assert len(results) == 230
+
+
 class TestResolveAndProbeWorker:
     @patch("api.requests.get")
     def test_resolves_bus_and_probes(self, mock_get):
@@ -808,7 +832,22 @@ class TestDepartureCard:
                         expected_iso="", departure_status="cancelled",
                         fetch_timestamp=time.time(), eta_seconds=300)
         card = DepartureCard(dep)
-        assert card.status_label.text() == "Annule"
+        # Shown once, in place of the countdown (a countdown would read as
+        # a train to catch), with the destination struck through.
+        assert card.countdown_label.text() == "Annule"
+        assert card.status_label.text() == ""
+        assert card.dest_label.font().strikeOut()
+
+    def test_cancelled_row_still_hides_once_gone(self):
+        dep = Departure(line_name="259", line_id="X", destination="Test",
+                        expected_iso="", departure_status="cancelled",
+                        fetch_timestamp=time.time() - 400, eta_seconds=300)
+        from PyQt5.QtWidgets import QWidget
+        parent = QWidget()
+        card = DepartureCard(dep, parent=parent)
+        assert card.isHidden()
+        dep.fetch_timestamp = time.time()
+        assert not DepartureCard(dep, parent=parent).isHidden()
 
     def test_clock_time_display(self):
         iso = "2025-06-15T14:35:00+02:00"
@@ -857,13 +896,13 @@ class TestFavouriteGroup:
         group = FavouriteGroup(sample_favourite, [], edit_mode=False)
         header_layout = group.layout().itemAt(0).layout()
         # Should only have the label (1 item)
-        assert header_layout.count() == 1
+        assert group.delete_btn is None
 
     def test_delete_button_in_edit_mode(self, sample_favourite):
         group = FavouriteGroup(sample_favourite, [], edit_mode=True)
         header_layout = group.layout().itemAt(0).layout()
         # Should have label + delete button (2 items)
-        assert header_layout.count() == 2
+        assert group.delete_btn is not None
 
     def test_delete_signal(self, sample_favourite):
         group = FavouriteGroup(sample_favourite, [], edit_mode=True)
@@ -871,7 +910,7 @@ class TestFavouriteGroup:
         group.delete_requested.connect(lambda fav: emitted.append(fav))
         # Click the delete button
         header_layout = group.layout().itemAt(0).layout()
-        del_btn = header_layout.itemAt(1).widget()
+        del_btn = group.delete_btn
         del_btn.click()
         assert len(emitted) == 1
         assert emitted[0].stop_area_id == "50980"
@@ -924,14 +963,14 @@ class TestHomeScreen:
         home.populate([sample_favourite], dep_map)
         group = home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 1  # just label
+        assert group.delete_btn is None
 
         # Enable edit mode and repopulate
         home.edit_mode = True
         home.populate([sample_favourite], dep_map)
         group = home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 2  # label + delete btn
+        assert group.delete_btn is not None
 
     def test_add_signal(self):
         home = HomeScreen()
@@ -1387,7 +1426,7 @@ class TestMainWindow:
         assert w.home.edit_mode is False
         group = w.home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 1
+        assert group.delete_btn is None
 
         # Toggle edit mode via button
         w.home.edit_btn.click()
@@ -1398,7 +1437,7 @@ class TestMainWindow:
         assert len(w.home.groups) == 1
         group = w.home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 2  # label + delete btn
+        assert group.delete_btn is not None
         w.close()
 
 
@@ -1598,7 +1637,7 @@ class TestEdgeCases:
                         fetch_timestamp=time.time(), eta_seconds=300)
 
         # First: show favourites
-        home.populate([fav], {"1_L1_": [dep]})
+        home.populate([fav], {fav.key: [dep]})
         _app.processEvents()
 
         # Second: empty
@@ -1606,7 +1645,7 @@ class TestEdgeCases:
         _app.processEvents()
 
         # Third: favourites again - should not crash
-        home.populate([fav], {"1_L1_": [dep]})
+        home.populate([fav], {fav.key: [dep]})
         _app.processEvents()
         assert len(home.groups) == 1
 
@@ -2234,3 +2273,75 @@ class TestSearchErrorFlag:
         s._had_error = True
         s.reset()
         assert not s._had_error
+
+
+class TestHomeImprovements:
+    @patch("main.load_favourites")
+    @patch("main.save_favourites")
+    def test_failed_group_is_flagged_stale(self, mock_save, mock_load):
+        from main import MainWindow
+        ok = Favourite("1", "A", "L1", "1", direction="x", destination_name="D")
+        ko = Favourite("2", "B", "L2", "2", direction="x", destination_name="D")
+        mock_load.return_value = [ok, ko]
+        w = MainWindow()
+        dep = Departure("1", "L1", "D", "", fetch_timestamp=time.time(),
+                        eta_seconds=300)
+        w.departure_map = {ko.key: [dep]}  # from an earlier, good fetch
+        w._departure_error_msg = "Erreur réseau"
+        w._on_departures_received({ok.key: [dep]})
+        _app.processEvents()
+        by_key = {g.favourite.key: g for g in w.home.groups}
+        assert by_key[ok.key].stale_label is None
+        assert by_key[ko.key].stale_label is not None
+        # Next fetch succeeds for both: flag goes away
+        w._departure_error_msg = None
+        w._on_departures_received({ok.key: [dep], ko.key: [dep]})
+        by_key = {g.favourite.key: g for g in w.home.groups}
+        assert by_key[ko.key].stale_label is None
+        w.close()
+
+    @patch("main.load_favourites")
+    @patch("main.save_favourites")
+    def test_move_favourite(self, mock_save, mock_load):
+        from main import MainWindow
+        a = Favourite("1", "A", "L1", "1")
+        b = Favourite("2", "B", "L2", "2")
+        c = Favourite("3", "C", "L3", "3")
+        mock_load.return_value = [a, b, c]
+        w = MainWindow()
+        w._move_favourite(c, -1)
+        assert [f.stop_name for f in w.favourites] == ["A", "C", "B"]
+        w._move_favourite(a, -1)  # already first: no-op
+        assert [f.stop_name for f in w.favourites] == ["A", "C", "B"]
+        assert mock_save.call_count == 1
+        w.close()
+
+    def test_move_buttons_only_in_edit_mode_and_bounded(self):
+        home = HomeScreen()
+        favs = [Favourite("1", "A", "L1", "1"), Favourite("2", "B", "L2", "2")]
+        moves = []
+        home.populate(favs, {}, move_callback=lambda f, d: moves.append((f.stop_name, d)))
+        assert home.groups[0].up_btn is None
+        home.edit_mode = True
+        home.populate(favs, {}, move_callback=lambda f, d: moves.append((f.stop_name, d)))
+        first, second = home.groups
+        assert not first.up_btn.isEnabled() and first.down_btn.isEnabled()
+        assert second.up_btn.isEnabled() and not second.down_btn.isEnabled()
+        first.down_btn.click()
+        assert moves == [("A", 1)]
+
+    def test_traffic_message_shown_for_line(self):
+        home = HomeScreen()
+        fav = Favourite("1", "A", "C01742", "A")
+        other = Favourite("2", "B", "C00000", "B")
+        home.populate([fav, other], {},
+                      traffic={"C01742": ["Trafic interrompu entre X et Y"]})
+        assert len(home.groups[0].traffic_labels) == 1
+        assert "interrompu" in home.groups[0].traffic_labels[0].text()
+        assert home.groups[1].traffic_labels == []
+
+    def test_header_clock_in_french(self):
+        home = HomeScreen()
+        home.update_clock(datetime(2026, 10, 25, 8, 5))
+        assert home.header_clock.text() == "08:05"
+        assert home.header_date.text() == "dimanche 25 octobre"

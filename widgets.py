@@ -21,6 +21,12 @@ TRANSPORT_MODES = [
     ("Train / RER", "rail", Icons.TRAIN),
 ]
 
+FRENCH_DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi",
+               "samedi", "dimanche"]
+FRENCH_MONTHS = ["janvier", "fevrier", "mars", "avril", "mai", "juin",
+                 "juillet", "aout", "septembre", "octobre", "novembre",
+                 "decembre"]
+
 TRANSPORT_MODE_LABELS = {mode: label for label, mode, _icon in TRANSPORT_MODES}
 
 
@@ -144,6 +150,10 @@ class DepartureCard(QFrame):
         self.dest_label.setObjectName("destinationLabel")
         self.dest_label.setWordWrap(True)
         mid.addWidget(self.dest_label)
+        if departure.departure_status == "cancelled":
+            font = self.dest_label.font()
+            font.setStrikeOut(True)
+            self.dest_label.setFont(font)
 
         status_text = self._format_status(departure)
         self.status_label = QLabel(status_text)
@@ -185,15 +195,19 @@ class DepartureCard(QFrame):
             "onTime": "A l'heure",
             "delayed": "En retard",
             "early": "En avance",
-            "cancelled": "Annule",
+            "cancelled": "",  # shown in place of the countdown instead
             "noReport": "",
             "arrived": "Arrive",
         }
         return status_map.get(dep.departure_status, dep.departure_status)
 
+    @property
+    def cancelled(self) -> bool:
+        return self.departure.departure_status == "cancelled"
+
     def update_countdown(self):
         """Recompute countdown from fetch_timestamp + eta_seconds."""
-        if self.eta_seconds <= 0:
+        if self.eta_seconds <= 0 and not self.cancelled:
             self._render_countdown("--", None)
             return
         elapsed = time.time() - self.fetch_timestamp
@@ -202,6 +216,10 @@ class DepartureCard(QFrame):
             # Long gone — drop the row instead of keeping "Parti" around
             # until the next refresh rebuilds the list.
             self.hide()
+        elif self.cancelled:
+            # No countdown for a train that won't come: it would read as
+            # one to catch.
+            self._render_countdown("Annule", "countdown_departed")
         elif remaining < -30:
             self._render_countdown("Parti", "countdown_departed")
         elif remaining < 60:
@@ -229,16 +247,20 @@ class DepartureCard(QFrame):
 # ─── FavouriteGroup ──────────────────────────────────────────────────────────
 
 class FavouriteGroup(QFrame):
-    """Groups departure cards for one favourite, with optional delete button."""
+    """Groups departure cards for one favourite, with edit controls."""
 
     delete_requested = pyqtSignal(object)  # emits the Favourite
+    move_requested = pyqtSignal(object, int)  # Favourite, -1 (up) / +1 (down)
 
     def __init__(self, favourite: Favourite, departures: list,
-                 edit_mode: bool = False, parent=None):
+                 edit_mode: bool = False, stale: bool = False,
+                 traffic: tuple = (), can_move_up: bool = False,
+                 can_move_down: bool = False, parent=None):
         super().__init__(parent)
         self.setObjectName("favouriteGroup")
         self.favourite = favourite
         self.cards = []
+        self.delete_btn = self.up_btn = self.down_btn = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -255,13 +277,34 @@ class FavouriteGroup(QFrame):
         header_row.addWidget(header_label, stretch=1)
 
         if edit_mode:
-            del_btn = QPushButton(Icons.CLOSE)
-            del_btn.setObjectName("deleteBtn")
-            del_btn.setFont(icon_font(14))
-            del_btn.clicked.connect(lambda: self.delete_requested.emit(self.favourite))
-            header_row.addWidget(del_btn)
+            self.up_btn = self._make_move_btn(Icons.ARROW_UP, -1, can_move_up)
+            self.down_btn = self._make_move_btn(Icons.ARROW_DOWN, 1, can_move_down)
+            header_row.addWidget(self.up_btn)
+            header_row.addWidget(self.down_btn)
+            self.delete_btn = QPushButton(Icons.CLOSE)
+            self.delete_btn.setObjectName("deleteBtn")
+            self.delete_btn.setFont(icon_font(14))
+            self.delete_btn.clicked.connect(
+                lambda: self.delete_requested.emit(self.favourite))
+            header_row.addWidget(self.delete_btn)
 
         layout.addLayout(header_row)
+
+        # Last refresh of this stop failed: the rows below are from an
+        # earlier fetch and may miss newly announced trains or delays.
+        self.stale_label = None
+        if stale and departures:
+            self.stale_label = QLabel("Donnees non actualisees")
+            self.stale_label.setObjectName("staleLabel")
+            layout.addWidget(self.stale_label)
+
+        self.traffic_labels = []
+        for message in traffic:
+            lbl = QLabel(f"\u26a0  {message}")
+            lbl.setObjectName("trafficLabel")
+            lbl.setWordWrap(True)
+            self.traffic_labels.append(lbl)
+            layout.addWidget(lbl)
 
         # Departure cards
         if departures:
@@ -278,6 +321,14 @@ class FavouriteGroup(QFrame):
             no_dep = QLabel("Aucun depart prevu")
             no_dep.setObjectName("noDepartureLabel")
             layout.addWidget(no_dep)
+
+    def _make_move_btn(self, icon: str, delta: int, enabled: bool) -> QPushButton:
+        btn = QPushButton(icon)
+        btn.setObjectName("moveBtn")
+        btn.setFont(icon_font(18))
+        btn.setEnabled(enabled)
+        btn.clicked.connect(lambda: self.move_requested.emit(self.favourite, delta))
+        return btn
 
     def update_countdowns(self):
         for card in self.cards:
@@ -319,9 +370,17 @@ class HomeScreen(QWidget):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 4, 12, 4)
 
-        title = QLabel("Prochains departs")
-        title.setObjectName("headerTitle")
-        header_layout.addWidget(title, stretch=1)
+        # Clock in place of a title: on a wall display the time is what
+        # you check alongside the departures.
+        self.header_clock = QLabel("")
+        self.header_clock.setObjectName("headerClock")
+        header_layout.addWidget(self.header_clock)
+        self.header_date = QLabel("")
+        self.header_date.setObjectName("headerDate")
+        self.header_date.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_layout.addSpacing(10)
+        header_layout.addWidget(self.header_date, stretch=1)
+        self.update_clock()
 
         self.refresh_btn = QPushButton(Icons.REFRESH)
         self.refresh_btn.setObjectName("headerBtn")
@@ -390,7 +449,8 @@ class HomeScreen(QWidget):
         )
         self.edit_toggled.emit()
 
-    def populate(self, favourites, departure_map, delete_callback=None):
+    def populate(self, favourites, departure_map, delete_callback=None,
+                 stale_keys=(), traffic=None, move_callback=None):
         """Rebuild the scroll area with favourite groups.
 
         Deferred while a touch scroll gesture is in flight: tearing the
@@ -399,7 +459,9 @@ class HomeScreen(QWidget):
         loses a release, QScroller stays "pressed" forever, and the list
         used to never refresh again until a reboot.
         """
-        self._pending_populate = (list(favourites), dict(departure_map), delete_callback)
+        self._pending_populate = (list(favourites), dict(departure_map),
+                                  delete_callback, set(stale_keys),
+                                  dict(traffic or {}), move_callback)
         scroller = QScroller.scroller(self.scroll.viewport())
         if scroller.state() != QScroller.Inactive:
             self._populate_retry.start()
@@ -422,7 +484,8 @@ class HomeScreen(QWidget):
         self._populate_deferred_since = None
         self._populate_retry.stop()
 
-        favourites, departure_map, delete_callback = self._pending_populate
+        (favourites, departure_map, delete_callback, stale_keys,
+         traffic, move_callback) = self._pending_populate
         self._pending_populate = None
 
         scroll_pos = self.scroll.verticalScrollBar().value()
@@ -443,12 +506,18 @@ class HomeScreen(QWidget):
             self.scroll_layout.addStretch()
             return
 
-        for fav in favourites:
-            fav_key = fav.key
-            departures = departure_map.get(fav_key, [])
-            group = FavouriteGroup(fav, departures, edit_mode=self.edit_mode)
+        last = len(favourites) - 1
+        for i, fav in enumerate(favourites):
+            group = FavouriteGroup(
+                fav, departure_map.get(fav.key, []),
+                edit_mode=self.edit_mode,
+                stale=fav.key in stale_keys,
+                traffic=tuple(traffic.get(fav.line_id, ())),
+                can_move_up=i > 0, can_move_down=i < last)
             if delete_callback:
                 group.delete_requested.connect(delete_callback)
+            if move_callback:
+                group.move_requested.connect(move_callback)
             self.groups.append(group)
             self.scroll_layout.addWidget(group)
 
@@ -458,8 +527,16 @@ class HomeScreen(QWidget):
 
     def update_countdowns(self):
         """Called every second to update all departure countdowns."""
+        self.update_clock()
         for group in self.groups:
             group.update_countdowns()
+
+    def update_clock(self, now: datetime = None):
+        now = now or datetime.now()
+        self.header_clock.setText(now.strftime("%H:%M"))
+        # Spelled out by hand: the Pi image has no French locale installed.
+        self.header_date.setText(
+            f"{FRENCH_DAYS[now.weekday()]} {now.day} {FRENCH_MONTHS[now.month - 1]}")
 
     def set_updated_time(self, text: str):
         self.updated_label.setText(text)

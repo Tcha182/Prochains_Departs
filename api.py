@@ -312,6 +312,25 @@ class StopsOnLineWorker(QObject):
     finished = pyqtSignal(list)  # [StopOnLine, ...]
     error = pyqtSignal(str)
 
+    PAGE_SIZE = 100  # API maximum per request
+    MAX_PAGES = 10   # long bus lines have well over 100 stop records
+
+    def _fetch_all(self, url):
+        """Yield every record for the line, page by page."""
+        for page in range(self.MAX_PAGES):
+            params = {
+                "where": f'id="{_sanitize_odsql(self.route_id)}"',
+                "limit": self.PAGE_SIZE,
+                "offset": page * self.PAGE_SIZE,
+                "select": "stop_name,stop_id",
+            }
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            records = resp.json().get("results", [])
+            yield from records
+            if len(records) < self.PAGE_SIZE:
+                return
+
     def __init__(self, route_id: str):
         super().__init__()
         self.route_id = route_id
@@ -319,18 +338,9 @@ class StopsOnLineWorker(QObject):
     def run(self):
         try:
             url = f"{OPEN_DATA_BASE}/catalog/datasets/{STOP_LINES_DATASET}/records"
-            params = {
-                "where": f'id="{_sanitize_odsql(self.route_id)}"',
-                "limit": 100,
-                "select": "stop_name,stop_id",
-            }
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-
             seen = set()
             results = []
-            for record in data.get("results", []):
+            for record in self._fetch_all(url):
                 name = record.get("stop_name", "")
                 if not name or name in seen:
                     continue
