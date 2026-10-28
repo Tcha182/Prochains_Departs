@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"  # Raspberry Pi OS Bookworm ships 3.11
+          cache: pip
+      - name: Install Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon0 libgl1
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyflakes
+      - name: Lint (unused imports, undefined names)
+        run: python -m pyflakes main.py api.py models.py styles.py widgets/
+      - name: Unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest test_app.py -m "not live" -q

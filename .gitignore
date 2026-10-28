@@ -7,3 +7,4 @@ debug_output.txt
 app.log
 app.log.*
 nul
+*.corrupt-*

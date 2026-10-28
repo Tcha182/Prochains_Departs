@@ -27,7 +27,7 @@ from models import (
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
     ResolveAndProbeWorker, StopAreaSearchWorker, LineDetailsWorker,
-    start_worker,
+    start_worker, TrafficWorker,
 )
 from widgets import DepartureCard, FavouriteGroup, HomeScreen, SearchScreen
 from styles import DARK_THEME
@@ -36,6 +36,21 @@ from styles import DARK_THEME
 # ═══════════════════════════════════════════════════════════════════════════════
 # FIXTURES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+def no_network(request):
+    """Unit tests never reach the real APIs: a worker started in the
+    background (e.g. by a MainWindow timer) fails fast instead of holding a
+    thread open on a slow network. Tests patch api.requests.get themselves
+    to provide responses; live tests are left alone."""
+    if request.node.get_closest_marker("live"):
+        yield
+        return
+    import requests as _requests
+    with patch("api.requests.get",
+               side_effect=_requests.ConnectionError("network disabled in tests")):
+        yield
+
 
 @pytest.fixture
 def tmp_fav_path(tmp_path):
@@ -175,6 +190,28 @@ class TestPersistence:
         assert len(loaded) == 2
         assert loaded[1].line_color == "FF0000"
 
+    def test_corrupt_file_is_kept_aside(self, tmp_path):
+        """A corrupt file must not be silently overwritten by the next save."""
+        path = str(tmp_path / "favourites.json")
+        with open(path, "w") as f:
+            f.write("NOT JSON{{{")
+        with patch("models.FAVOURITES_PATH", path):
+            assert load_favourites() == []
+            save_favourites([Favourite("1", "A", "L1", "1")])
+        backups = [n for n in os.listdir(tmp_path) if ".corrupt-" in n]
+        assert len(backups) == 1
+        with open(tmp_path / backups[0]) as f:
+            assert f.read() == "NOT JSON{{{"
+
+    def test_unknown_fields_are_ignored(self, tmp_path):
+        path = str(tmp_path / "favourites.json")
+        with open(path, "w") as f:
+            json.dump([{"stop_area_id": "1", "stop_name": "A", "line_id": "L",
+                        "line_name": "1", "future_field": True}], f)
+        with patch("models.FAVOURITES_PATH", path):
+            loaded = load_favourites()
+        assert loaded[0].stop_name == "A"
+
     def test_unicode_persistence(self, tmp_fav_path):
         fav = Favourite("1", "Pavillon Halévy", "L1", "259", destination_name="Saint-Germain-en-Laye <RER>")
         with patch("models.FAVOURITES_PATH", tmp_fav_path):
@@ -289,8 +326,8 @@ class TestDepartureWorkerRun:
         assert mock_get.call_count == 1
 
         # Each favourite gets its own filtered departures
-        key1 = f"50980_C02000_{fav1.direction}"
-        key2 = f"50980_C02000_{fav2.direction}"
+        key1 = fav1.key
+        key2 = fav2.key
         assert key1 in results
         assert key2 in results
         # Saint-Germain favourite gets Saint-Germain departure
@@ -327,7 +364,7 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = f"50980_C02000_{sample_favourite.direction}"
+        key = sample_favourite.key
         assert len(results[key]) <= 5
 
     @patch("api.requests.get")
@@ -353,7 +390,7 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = "50980_C02000_1"
+        key = fav.key
         assert len(results[key]) == 1
         assert results[key][0].destination == "Saint-Germain"
 
@@ -380,8 +417,38 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = "50980_C02000_"
+        key = fav.key
         assert len(results[key]) == 2
+
+    @patch("api.requests.get")
+    def test_branches_sharing_a_direction_stay_separate(self, mock_get):
+        """RER B: Robinson and Saint-Remy share DirectionRef; each favourite
+        must keep its own departures."""
+        now = datetime.now(timezone.utc)
+        t1 = (now + timedelta(minutes=3)).isoformat()
+        t2 = (now + timedelta(minutes=6)).isoformat()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = make_siri_response([
+            {"destination": "Robinson", "expected_time": t1, "direction_ref": "A"},
+            {"destination": "Saint-Remy-les-Chevreuse", "expected_time": t2,
+             "direction_ref": "A"},
+        ])
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+        fav_r = Favourite("1", "Gare du Nord", "C01743", "B",
+                          direction="A", destination_name="Robinson")
+        fav_s = Favourite("1", "Gare du Nord", "C01743", "B",
+                          direction="A", destination_name="Saint-Remy-les-Chevreuse")
+        assert fav_r.key != fav_s.key
+
+        worker = DepartureWorker([fav_r, fav_s])
+        results = {}
+        worker.finished.connect(lambda r: results.update(r))
+        worker.run()
+
+        assert [d.destination for d in results[fav_r.key]] == ["Robinson"]
+        assert [d.destination for d in results[fav_s.key]] == [
+            "Saint-Remy-les-Chevreuse"]
 
     @patch("api.requests.get")
     def test_run_filters_terminus_arrivals(self, mock_get):
@@ -408,7 +475,7 @@ class TestDepartureWorkerRun:
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
 
-        key = "43114_C01742_1"
+        key = fav.key
         # Only "Marne-la-Vallee Chessy" should remain; both Saint-Germain variants filtered
         assert len(results[key]) == 1
         assert "Marne" in results[key][0].destination
@@ -557,6 +624,30 @@ class TestStopsOnLineWorker:
         worker.run()
         assert results == []
         assert len(errors) == 1
+
+
+class TestStopsOnLinePagination:
+    @patch("api.requests.get")
+    def test_fetches_every_page(self, mock_get):
+        """Lines with more than 100 stop records must not be cut off."""
+        def page(params):
+            offset = params["offset"]
+            n = 100 if offset < 200 else 30
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {"results": [
+                {"stop_name": f"Arret {offset + i:03d}", "stop_id": str(offset + i)}
+                for i in range(n)]}
+            return resp
+        mock_get.side_effect = lambda url, params, timeout: page(params)
+
+        worker = StopsOnLineWorker("IDFM:C01234")
+        results = []
+        worker.finished.connect(lambda r: results.extend(r))
+        worker.run()
+
+        assert mock_get.call_count == 3
+        assert len(results) == 230
 
 
 class TestResolveAndProbeWorker:
@@ -756,7 +847,22 @@ class TestDepartureCard:
                         expected_iso="", departure_status="cancelled",
                         fetch_timestamp=time.time(), eta_seconds=300)
         card = DepartureCard(dep)
-        assert card.status_label.text() == "Annule"
+        # Shown once, in place of the countdown (a countdown would read as
+        # a train to catch), with the destination struck through.
+        assert card.countdown_label.text() == "Annule"
+        assert card.status_label.text() == ""
+        assert card.dest_label.font().strikeOut()
+
+    def test_cancelled_row_still_hides_once_gone(self):
+        dep = Departure(line_name="259", line_id="X", destination="Test",
+                        expected_iso="", departure_status="cancelled",
+                        fetch_timestamp=time.time() - 400, eta_seconds=300)
+        from PyQt5.QtWidgets import QWidget
+        parent = QWidget()
+        card = DepartureCard(dep, parent=parent)
+        assert card.isHidden()
+        dep.fetch_timestamp = time.time()
+        assert not DepartureCard(dep, parent=parent).isHidden()
 
     def test_clock_time_display(self):
         iso = "2025-06-15T14:35:00+02:00"
@@ -805,13 +911,13 @@ class TestFavouriteGroup:
         group = FavouriteGroup(sample_favourite, [], edit_mode=False)
         header_layout = group.layout().itemAt(0).layout()
         # Should only have the label (1 item)
-        assert header_layout.count() == 1
+        assert group.delete_btn is None
 
     def test_delete_button_in_edit_mode(self, sample_favourite):
         group = FavouriteGroup(sample_favourite, [], edit_mode=True)
         header_layout = group.layout().itemAt(0).layout()
         # Should have label + delete button (2 items)
-        assert header_layout.count() == 2
+        assert group.delete_btn is not None
 
     def test_delete_signal(self, sample_favourite):
         group = FavouriteGroup(sample_favourite, [], edit_mode=True)
@@ -819,7 +925,7 @@ class TestFavouriteGroup:
         group.delete_requested.connect(lambda fav: emitted.append(fav))
         # Click the delete button
         header_layout = group.layout().itemAt(0).layout()
-        del_btn = header_layout.itemAt(1).widget()
+        del_btn = group.delete_btn
         del_btn.click()
         assert len(emitted) == 1
         assert emitted[0].stop_area_id == "50980"
@@ -844,13 +950,13 @@ class TestHomeScreen:
 
     def test_populate_with_favourites(self, sample_favourite, sample_departure):
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         home.populate([sample_favourite], dep_map)
         assert len(home.groups) == 1
 
     def test_populate_clears_old_groups(self, sample_favourite, sample_departure):
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         home.populate([sample_favourite], dep_map)
         assert len(home.groups) == 1
         # Populate again with empty
@@ -867,19 +973,19 @@ class TestHomeScreen:
 
     def test_edit_mode_shows_delete_buttons(self, sample_favourite, sample_departure):
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         # Normal mode - no delete buttons
         home.populate([sample_favourite], dep_map)
         group = home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 1  # just label
+        assert group.delete_btn is None
 
         # Enable edit mode and repopulate
         home.edit_mode = True
         home.populate([sample_favourite], dep_map)
         group = home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 2  # label + delete btn
+        assert group.delete_btn is not None
 
     def test_add_signal(self):
         home = HomeScreen()
@@ -910,7 +1016,7 @@ class TestHomeScreen:
     def test_repopulate_empty_after_populated(self, sample_favourite, sample_departure):
         """Verify we can go from populated -> empty -> populated without crash."""
         home = HomeScreen()
-        dep_map = {f"50980_C02000_{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         home.populate([sample_favourite], dep_map)
         assert len(home.groups) == 1
 
@@ -1328,14 +1434,14 @@ class TestMainWindow:
         w = MainWindow()
         dep = Departure("259", "X", "Saint-Germain", "",
                         fetch_timestamp=time.time(), eta_seconds=300)
-        w.departure_map = {"50980_C02000_1": [dep]}
+        w.departure_map = {fav.key: [dep]}
         w._rebuild_home()
 
         # Normal mode: no delete buttons
         assert w.home.edit_mode is False
         group = w.home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 1
+        assert group.delete_btn is None
 
         # Toggle edit mode via button
         w.home.edit_btn.click()
@@ -1346,7 +1452,7 @@ class TestMainWindow:
         assert len(w.home.groups) == 1
         group = w.home.groups[0]
         header_layout = group.layout().itemAt(0).layout()
-        assert header_layout.count() == 2  # label + delete btn
+        assert group.delete_btn is not None
         w.close()
 
 
@@ -1404,7 +1510,7 @@ class TestLiveAPIs:
         results = {}
         worker.finished.connect(lambda r: results.update(r))
         worker.run()
-        key = "50980_C02000_1"
+        key = fav.key
         assert key in results
         # May be empty during night, but key should exist
 
@@ -1546,7 +1652,7 @@ class TestEdgeCases:
                         fetch_timestamp=time.time(), eta_seconds=300)
 
         # First: show favourites
-        home.populate([fav], {"1_L1_": [dep]})
+        home.populate([fav], {fav.key: [dep]})
         _app.processEvents()
 
         # Second: empty
@@ -1554,7 +1660,7 @@ class TestEdgeCases:
         _app.processEvents()
 
         # Third: favourites again - should not crash
-        home.populate([fav], {"1_L1_": [dep]})
+        home.populate([fav], {fav.key: [dep]})
         _app.processEvents()
         assert len(home.groups) == 1
 
@@ -2148,11 +2254,10 @@ class TestRefreshRobustness:
             self, sample_favourite, sample_departure):
         from PyQt5.QtWidgets import QScroller
         home = HomeScreen()
-        dep_map = {f"{sample_favourite.stop_area_id}_{sample_favourite.line_id}_"
-                   f"{sample_favourite.direction}": [sample_departure]}
+        dep_map = {sample_favourite.key: [sample_departure]}
         fake = MagicMock()
         fake.state.return_value = QScroller.Pressed  # lost touch release
-        with patch("widgets.QScroller.scroller", return_value=fake):
+        with patch("widgets.home.QScroller.scroller", return_value=fake):
             home.populate([sample_favourite], dep_map)
             home._apply_pending_populate()  # first retry: starts the clock
             assert home.groups == []  # deferred while "pressed"
@@ -2183,3 +2288,206 @@ class TestSearchErrorFlag:
         s._had_error = True
         s.reset()
         assert not s._had_error
+
+
+class TestHomeImprovements:
+    @patch("main.load_favourites")
+    @patch("main.save_favourites")
+    def test_failed_group_is_flagged_stale(self, mock_save, mock_load):
+        from main import MainWindow
+        ok = Favourite("1", "A", "L1", "1", direction="x", destination_name="D")
+        ko = Favourite("2", "B", "L2", "2", direction="x", destination_name="D")
+        mock_load.return_value = [ok, ko]
+        w = MainWindow()
+        dep = Departure("1", "L1", "D", "", fetch_timestamp=time.time(),
+                        eta_seconds=300)
+        w.departure_map = {ko.key: [dep]}  # from an earlier, good fetch
+        w._departure_error_msg = "Erreur réseau"
+        w._on_departures_received({ok.key: [dep]})
+        _app.processEvents()
+        by_key = {g.favourite.key: g for g in w.home.groups}
+        assert by_key[ok.key].stale_label is None
+        assert by_key[ko.key].stale_label is not None
+        # Next fetch succeeds for both: flag goes away
+        w._departure_error_msg = None
+        w._on_departures_received({ok.key: [dep], ko.key: [dep]})
+        by_key = {g.favourite.key: g for g in w.home.groups}
+        assert by_key[ko.key].stale_label is None
+        w.close()
+
+    @patch("main.load_favourites")
+    @patch("main.save_favourites")
+    def test_move_favourite(self, mock_save, mock_load):
+        from main import MainWindow
+        a = Favourite("1", "A", "L1", "1")
+        b = Favourite("2", "B", "L2", "2")
+        c = Favourite("3", "C", "L3", "3")
+        mock_load.return_value = [a, b, c]
+        w = MainWindow()
+        w._move_favourite(c, -1)
+        assert [f.stop_name for f in w.favourites] == ["A", "C", "B"]
+        w._move_favourite(a, -1)  # already first: no-op
+        assert [f.stop_name for f in w.favourites] == ["A", "C", "B"]
+        assert mock_save.call_count == 1
+        w.close()
+
+    def test_move_buttons_only_in_edit_mode_and_bounded(self):
+        home = HomeScreen()
+        favs = [Favourite("1", "A", "L1", "1"), Favourite("2", "B", "L2", "2")]
+        moves = []
+        home.populate(favs, {}, move_callback=lambda f, d: moves.append((f.stop_name, d)))
+        assert home.groups[0].up_btn is None
+        home.edit_mode = True
+        home.populate(favs, {}, move_callback=lambda f, d: moves.append((f.stop_name, d)))
+        first, second = home.groups
+        assert not first.up_btn.isEnabled() and first.down_btn.isEnabled()
+        assert second.up_btn.isEnabled() and not second.down_btn.isEnabled()
+        first.down_btn.click()
+        assert moves == [("A", 1)]
+
+    def test_traffic_message_shown_for_line(self):
+        home = HomeScreen()
+        fav = Favourite("1", "A", "C01742", "A")
+        other = Favourite("2", "B", "C00000", "B")
+        home.populate([fav, other], {},
+                      traffic={"C01742": ["Trafic interrompu entre X et Y"]})
+        assert len(home.groups[0].traffic_labels) == 1
+        assert "interrompu" in home.groups[0].traffic_labels[0].text()
+        assert home.groups[1].traffic_labels == []
+
+    def test_header_clock_in_french(self):
+        home = HomeScreen()
+        home.update_clock(datetime(2026, 10, 25, 8, 5))
+        assert home.header_clock.text() == "08:05"
+        assert home.header_date.text() == "dimanche 25 octobre"
+
+
+def _general_message(messages, ts="2026-10-25T08:00:00Z"):
+    return {"Siri": {"ServiceDelivery": {
+        "ResponseTimestamp": ts,
+        "GeneralMessageDelivery": [{"InfoMessage": messages}]}}}
+
+
+def _info(text, channel="Perturbation", until="2026-10-25T20:00:00Z",
+          msg_type="SHORT_MESSAGE"):
+    return {"InfoChannelRef": {"value": channel}, "ValidUntilTime": until,
+            "Content": {"Message": [{"MessageType": msg_type,
+                                     "MessageText": {"value": text}}]}}
+
+
+class TestTrafficWorker:
+    def test_keeps_current_perturbations_only(self):
+        data = _general_message([
+            _info("Trafic interrompu entre A et B"),
+            _info("Nouveau: abonnement", channel="Commercial"),
+            _info("Travaux termines", until="2026-10-24T20:00:00Z"),
+            _info("Trafic interrompu entre A et B"),  # duplicate
+        ])
+        assert TrafficWorker.parse(data, 0) == ["Trafic interrompu entre A et B"]
+
+    def test_prefers_short_message_and_strips_html(self):
+        info = _info("<p>Long <b>texte</b></p>", msg_type="LONG_MESSAGE")
+        info["Content"]["Message"].append(
+            {"MessageType": "SHORT_MESSAGE", "MessageText": {"value": "Court"}})
+        assert TrafficWorker.parse(_general_message([info]), 0) == ["Court"]
+        only_long = _info("<p>Long  <b>texte</b></p>", msg_type="LONG_MESSAGE")
+        assert TrafficWorker.parse(_general_message([only_long]), 0) == ["Long texte"]
+
+    def test_truncates_and_caps_count(self):
+        data = _general_message([_info("x" * 500), _info("b"), _info("c")])
+        msgs = TrafficWorker.parse(data, 0)
+        assert len(msgs) == 2
+        assert len(msgs[0]) == TrafficWorker.MAX_CHARS
+
+    def test_empty_or_odd_payloads(self):
+        assert TrafficWorker.parse({}, 0) == []
+        assert TrafficWorker.parse({"Siri": {"ServiceDelivery": {
+            "GeneralMessageDelivery": [{}]}}}, 0) == []
+
+    @patch("api.requests.get")
+    def test_failed_line_is_left_out(self, mock_get):
+        import requests as _requests
+        ok = MagicMock()
+        ok.raise_for_status = MagicMock()
+        ok.json.return_value = _general_message([_info("Panne")])
+        bad = MagicMock()
+        bad.raise_for_status.side_effect = _requests.HTTPError("403")
+        mock_get.side_effect = [ok, bad]
+        worker = TrafficWorker(["L1", "L2", "L1"])
+        out = {}
+        worker.finished.connect(out.update)
+        worker.run()
+        assert out == {"L1": ["Panne"]}
+        assert mock_get.call_count == 2  # duplicates fetched once
+
+    @patch("main.load_favourites")
+    @patch("main.save_favourites")
+    def test_main_window_shows_traffic(self, mock_save, mock_load):
+        from main import MainWindow
+        fav = Favourite("1", "A", "C01742", "A")
+        mock_load.return_value = [fav]
+        w = MainWindow()
+        w._on_traffic_received({"C01742": ["Trafic perturbe"], "X": []})
+        assert w._traffic == {"C01742": ["Trafic perturbe"]}
+        _app.processEvents()
+        assert len(w.home.groups[0].traffic_labels) == 1
+        w.close()
+
+
+class TestEveningDimming:
+    def _fake_backlight(self, tmp_path, max_level=255):
+        dev = tmp_path / "rpi_backlight"
+        dev.mkdir()
+        (dev / "max_brightness").write_text(f"{max_level}\n")
+        (dev / "brightness").write_text(f"{max_level}\n")
+        return dev
+
+    @patch("main.load_favourites", return_value=[])
+    def test_dims_in_evening_and_restores_by_day(self, mock_load, tmp_path):
+        from main import MainWindow
+        dev = self._fake_backlight(tmp_path)
+        with patch("main.glob.glob", return_value=[str(dev)]), \
+                patch("main.datetime") as mock_dt, \
+                patch("main.save_settings"):
+            mock_dt.now.return_value = MagicMock(hour=22)
+            w = MainWindow()
+            w._settings.evening_brightness = 50
+            w._brightness_pct = None
+            w._apply_brightness()
+            assert (dev / "brightness").read_text() == "128"
+
+            mock_dt.now.return_value = MagicMock(hour=10)
+            w._apply_brightness()
+            assert (dev / "brightness").read_text() == "255"
+
+            # Setting change applies straight away in the evening
+            mock_dt.now.return_value = MagicMock(hour=6)
+            w._on_evening_brightness_changed(25)
+            assert (dev / "brightness").read_text() == "64"
+            w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_writes_only_on_change(self, mock_load, tmp_path):
+        from main import MainWindow
+        dev = self._fake_backlight(tmp_path)
+        with patch("main.glob.glob", return_value=[str(dev)]), \
+                patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=12)
+            w = MainWindow()
+            w._brightness_pct = None
+            w._apply_brightness()
+            (dev / "brightness").write_text("7")  # changed behind our back
+            w._apply_brightness()  # same level: no write
+            assert (dev / "brightness").read_text() == "7"
+            w.close()
+
+    def test_settings_row_cycles(self):
+        from widgets import SettingsScreen
+        screen = SettingsScreen(current_dim=100)
+        got = []
+        screen.evening_brightness_changed.connect(got.append)
+        screen._cycle_dim()
+        screen._cycle_dim()
+        screen._cycle_dim()
+        assert got == [50, 25, 100]
+        assert screen.dim_row._value_label.text() == "Desactive"

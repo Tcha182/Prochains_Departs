@@ -13,7 +13,7 @@ from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from dotenv import load_dotenv
 
 from models import (
-    Favourite, Departure, LineAtStop, StopOnLine, StopAreaMatch,
+    Departure, LineAtStop, StopOnLine, StopAreaMatch,
     normalize, is_same_place,
 )
 
@@ -40,6 +40,7 @@ def _sanitize_odsql(value: str) -> str:
 
 
 SIRI_URL = "https://prim.iledefrance-mobilites.fr/marketplace/stop-monitoring"
+GENERAL_MESSAGE_URL = "https://prim.iledefrance-mobilites.fr/marketplace/general-message"
 OPEN_DATA_BASE = "https://data.iledefrance-mobilites.fr/api/explore/v2.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STOPS_DATASET = "arrets"
@@ -167,7 +168,7 @@ class DepartureWorker(QObject):
             # Distribute departures to each favourite based on direction
             results = {}
             for fav in favs:
-                fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
+                fav_key = fav.key
                 stop_norm = normalize(fav.stop_name)
                 matched = [
                     d for d in all_departures
@@ -247,6 +248,83 @@ class DepartureWorker(QObject):
         return departures
 
 
+# ─── Traffic Info Worker ─────────────────────────────────────────────────────
+
+class TrafficWorker(QObject):
+    """Fetches current disruptions (SIRI Lite general-message) per line.
+
+    Emits {line_id: [text, ...]} for the lines fetched successfully; a line
+    whose fetch failed is left out, so an outdated disruption never stays
+    on screen. Needs the PRIM "info trafic" API enabled for the key: when
+    it isn't (401/403) the feature just stays silent.
+    """
+
+    finished = pyqtSignal(dict)
+
+    MAX_MESSAGES_PER_LINE = 2
+    MAX_CHARS = 160
+
+    def __init__(self, line_ids: list):
+        super().__init__()
+        self.line_ids = list(dict.fromkeys(line_ids))  # unique, ordered
+
+    def run(self):
+        results = {}
+        try:
+            for line_id in self.line_ids:
+                try:
+                    results[line_id] = self._fetch_line(line_id)
+                except requests.RequestException as e:
+                    log.info("traffic info unavailable for %s: %s", line_id, e)
+                except (KeyError, ValueError, TypeError, AttributeError) as e:
+                    log.warning("bad traffic info for %s: %s", line_id, e)
+        except Exception:
+            log.exception("unexpected error in TrafficWorker")
+        self.finished.emit(results)
+
+    def _fetch_line(self, line_id: str) -> list:
+        resp = requests.get(
+            GENERAL_MESSAGE_URL,
+            headers={"apikey": get_api_token()},
+            params={"LineRef": f"STIF:Line::{line_id}:"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return self.parse(resp.json(), time.time())
+
+    @classmethod
+    def parse(cls, data: dict, fetch_ts: float) -> list:
+        service = data.get("Siri", {}).get("ServiceDelivery", {})
+        now = _parse_iso_epoch(service.get("ResponseTimestamp", "")) or fetch_ts
+        messages = []
+        for delivery in service.get("GeneralMessageDelivery") or []:
+            for info in delivery.get("InfoMessage") or []:
+                channel = (info.get("InfoChannelRef") or {}).get("value", "")
+                if channel and channel != "Perturbation":
+                    continue  # skip commercial / general information
+                until = _parse_iso_epoch(info.get("ValidUntilTime", ""))
+                if until is not None and until < now:
+                    continue
+                text = cls._message_text(info.get("Content") or {})
+                if text and text not in messages:
+                    messages.append(text)
+        return messages[:cls.MAX_MESSAGES_PER_LINE]
+
+    @classmethod
+    def _message_text(cls, content: dict) -> str:
+        texts = {}
+        for msg in content.get("Message") or []:
+            value = (msg.get("MessageText") or {}).get("value") or ""
+            texts.setdefault(msg.get("MessageType", ""), value)
+        text = texts.get("SHORT_MESSAGE") or next(
+            (t for t in texts.values() if t), "")
+        text = re.sub(r"<[^>]+>", " ", text)  # some messages carry HTML
+        text = " ".join(text.split())
+        if len(text) > cls.MAX_CHARS:
+            text = text[:cls.MAX_CHARS - 1].rstrip() + "\u2026"
+        return text
+
+
 # ─── Line Search Worker ──────────────────────────────────────────────────────
 
 class LineSearchWorker(QObject):
@@ -312,6 +390,25 @@ class StopsOnLineWorker(QObject):
     finished = pyqtSignal(list)  # [StopOnLine, ...]
     error = pyqtSignal(str)
 
+    PAGE_SIZE = 100  # API maximum per request
+    MAX_PAGES = 10   # long bus lines have well over 100 stop records
+
+    def _fetch_all(self, url):
+        """Yield every record for the line, page by page."""
+        for page in range(self.MAX_PAGES):
+            params = {
+                "where": f'id="{_sanitize_odsql(self.route_id)}"',
+                "limit": self.PAGE_SIZE,
+                "offset": page * self.PAGE_SIZE,
+                "select": "stop_name,stop_id",
+            }
+            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            records = resp.json().get("results", [])
+            yield from records
+            if len(records) < self.PAGE_SIZE:
+                return
+
     def __init__(self, route_id: str):
         super().__init__()
         self.route_id = route_id
@@ -319,18 +416,9 @@ class StopsOnLineWorker(QObject):
     def run(self):
         try:
             url = f"{OPEN_DATA_BASE}/catalog/datasets/{STOP_LINES_DATASET}/records"
-            params = {
-                "where": f'id="{_sanitize_odsql(self.route_id)}"',
-                "limit": 100,
-                "select": "stop_name,stop_id",
-            }
-            resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-
             seen = set()
             results = []
-            for record in data.get("results", []):
+            for record in self._fetch_all(url):
                 name = record.get("stop_name", "")
                 if not name or name in seen:
                     continue

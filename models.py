@@ -1,11 +1,15 @@
 """Data classes, shared helpers, and JSON persistence for favourites."""
 
 import json
+import logging
 import os
+import time
 import re
 import unicodedata
 from dataclasses import dataclass, asdict, field
 from typing import List
+
+log = logging.getLogger("departs.models")
 
 FAVOURITES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favourites.json")
 
@@ -35,6 +39,15 @@ class Favourite:
     line_text_color: str = "000000"
     direction: str = ""
     destination_name: str = ""
+
+    @property
+    def key(self) -> str:
+        """Identity of this favourite, shared by the departure map, the
+        duplicate check and deletion. The destination is part of it: on a
+        branching line (RER B, metro 13...) both branches often share one
+        DirectionRef, so stop+line+direction alone made them collide."""
+        return (f"{self.stop_area_id}_{self.line_id}_{self.direction}"
+                f"_{self.destination_name}")
 
 
 @dataclass
@@ -74,6 +87,17 @@ class StopAreaMatch:
     routes: dict = field(default_factory=dict)  # {line_id: stop_id}
 
 
+def _set_aside_corrupt(path: str) -> None:
+    """Keep an unreadable file instead of letting the next save overwrite it,
+    so the favourites can still be recovered by hand."""
+    backup = f"{path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        os.replace(path, backup)
+        log.error("unreadable %s, kept as %s", os.path.basename(path), backup)
+    except OSError:
+        log.exception("could not set aside unreadable %s", path)
+
+
 def load_favourites() -> List[Favourite]:
     """Load favourites from JSON file."""
     if not os.path.exists(FAVOURITES_PATH):
@@ -81,8 +105,12 @@ def load_favourites() -> List[Favourite]:
     try:
         with open(FAVOURITES_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return [Favourite(**item) for item in data]
-    except (json.JSONDecodeError, TypeError, KeyError):
+        known = Favourite.__dataclass_fields__
+        return [Favourite(**{k: v for k, v in item.items() if k in known})
+                for item in data]
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError,
+            KeyError, AttributeError):
+        _set_aside_corrupt(FAVOURITES_PATH)
         return []
 
 
@@ -100,6 +128,7 @@ def save_favourites(favourites: List[Favourite]) -> None:
 class AppSettings:
     theme: str = "dark"            # "dark" or "light"
     sleep_delay_minutes: int = 10  # 0 = disabled
+    evening_brightness: int = 50   # % of full backlight in the evening; 100 = no dimming
 
 SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
