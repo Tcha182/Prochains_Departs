@@ -515,6 +515,7 @@ class SleepOverlay(QWidget):
 # ─── SettingsScreen ──────────────────────────────────────────────────────────
 
 SLEEP_OPTIONS = [5, 10, 30, 0]  # 0 = disabled
+WIFI_CONNECTED_COLOR = "#2ea043"
 SLEEP_LABELS = {5: "5 min", 10: "10 min", 30: "30 min", 0: "Désactivé"}
 
 
@@ -583,6 +584,10 @@ class SettingsScreen(QWidget):
         # WiFi row
         wifi_row = self._make_settings_row("WiFi", Icons.CHEVRON_RIGHT)
         wifi_row.tapped.connect(self._open_wifi)
+        # Connection state, shown right on the row (before the chevron)
+        self.wifi_row_status = QLabel("")
+        self.wifi_row_status.setObjectName("settingsValue")
+        wifi_row.layout().insertWidget(1, self.wifi_row_status)
         content_layout.addWidget(wifi_row)
 
         # API key row
@@ -669,6 +674,18 @@ class SettingsScreen(QWidget):
             return  # app is about to restart, leave the message as-is
         self._update_in_progress = False
         QTimer.singleShot(3000, lambda: self.update_row._value_label.setText("Vérifier"))
+
+    def set_wifi_status(self, available: bool, ssid: str):
+        """Show which network the Pi is on, on the WiFi row and page."""
+        if not available:
+            text, color = "Non disponible", ""
+        elif ssid:
+            text, color = f"Connecté · {ssid}", WIFI_CONNECTED_COLOR
+        else:
+            text = "Non connecté"
+            color = THEME_COLORS[get_theme()]["countdown_imminent"]
+        self.wifi_row_status.setText(text)
+        self.wifi_row_status.setStyleSheet(f"color: {color};" if color else "")
 
     def _open_wifi(self):
         self.wifi_status.setText("Recherche...")
@@ -758,7 +775,11 @@ class SettingsScreen(QWidget):
 
     def on_wifi_scan_results(self, networks: list):
         """Called from main window when scan results arrive."""
-        self.wifi_status.setText("")
+        current = next((n["ssid"] for n in networks if n["in_use"]), "")
+        self.wifi_status.setText(f"Connecté à {current}" if current
+                                 else "Non connecté - choisissez un réseau")
+        if networks and networks[0]["signal"] > 0 or current:
+            self.set_wifi_status(True, current)
         self._clear_layout(self.wifi_list_layout)
 
         if not networks:
@@ -779,12 +800,17 @@ class SettingsScreen(QWidget):
             if net["in_use"]:
                 check = QLabel(Icons.CHECK)
                 check.setFont(icon_font(16))
-                check.setStyleSheet("color: #238636;")
+                check.setStyleSheet(f"color: {WIFI_CONNECTED_COLOR};")
                 item_layout.addWidget(check)
 
             ssid_label = QLabel(net["ssid"])
             ssid_label.setObjectName("settingsLabel")
             item_layout.addWidget(ssid_label, stretch=1)
+
+            if net["in_use"]:
+                connected = QLabel("Connecté")
+                connected.setStyleSheet(f"color: {WIFI_CONNECTED_COLOR}; font-weight: bold;")
+                item_layout.addWidget(connected)
 
             # Lock icon for secured networks
             if net["security"] and net["security"] != "--":

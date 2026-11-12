@@ -2320,3 +2320,36 @@ class TestFavouriteModel:
             "added_by_future_version": True}]), encoding="utf-8")
         with patch("models.FAVOURITES_PATH", str(path)):
             assert len(load_favourites()) == 1
+
+
+class TestWiFiStatus:
+    @patch("api.subprocess.run")
+    def test_status_worker_reports_ssid(self, mock_run):
+        from api import WiFiStatusWorker
+        mock_run.return_value = MagicMock(stdout=" :Voisin\n*:Box\:Salon\n", returncode=0)
+        worker = WiFiStatusWorker()
+        got = []
+        worker.finished.connect(lambda ok, ssid: got.append((ok, ssid)))
+        worker.run()
+        assert got == [(True, "Box:Salon")]
+
+    @patch("api.subprocess.run", side_effect=FileNotFoundError)
+    def test_status_worker_without_nmcli(self, _):
+        from api import WiFiStatusWorker
+        worker = WiFiStatusWorker()
+        got = []
+        worker.finished.connect(lambda ok, ssid: got.append((ok, ssid)))
+        worker.run()
+        assert got == [(False, "")]
+
+    def test_settings_row_shows_connection(self):
+        from widgets import SettingsScreen
+        s = SettingsScreen()
+        s.set_wifi_status(True, "Box")
+        assert s.wifi_row_status.text() == "Connecté · Box"
+        s.set_wifi_status(True, "")
+        assert s.wifi_row_status.text() == "Non connecté"
+        s.on_wifi_scan_results([
+            {"ssid": "Box", "signal": 70, "security": "WPA2", "in_use": True}])
+        assert s.wifi_row_status.text() == "Connecté · Box"
+        assert s.wifi_status.text() == "Connecté à Box"

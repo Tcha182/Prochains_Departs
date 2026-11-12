@@ -23,7 +23,7 @@ from models import (
 from api import (
     DepartureWorker, LineSearchWorker, StopsOnLineWorker,
     ResolveAndProbeWorker, StopAreaSearchWorker, LineDetailsWorker,
-    WiFiScanWorker, WiFiConnectWorker, UpdateWorker,
+    WiFiScanWorker, WiFiStatusWorker, WiFiConnectWorker, UpdateWorker,
     start_worker,
 )
 from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard
@@ -248,6 +248,7 @@ class MainWindow(QMainWindow):
     def _show_settings(self):
         self.settings_screen.stack.setCurrentIndex(0)
         self.stack.setCurrentIndex(2)
+        self._launch_worker(WiFiStatusWorker(), self.settings_screen.set_wifi_status)
 
     # ── Favourites management ────────────────────────────────────────────────
 

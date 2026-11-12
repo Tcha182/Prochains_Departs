@@ -561,6 +561,35 @@ class LineDetailsWorker(QObject):
 
 # ─── WiFi Scan Worker ────────────────────────────────────────────────────────
 
+def _split_nmcli(line: str) -> list:
+    """Split an `nmcli -t` line. Terse mode escapes ':' and '\\' inside
+    values (SSIDs can contain both)."""
+    return [re.sub(r"\\(.)", r"\1", p) for p in re.split(r"(?<!\\):", line)]
+
+
+class WiFiStatusWorker(QObject):
+    """Reports the WiFi network currently in use, without a slow rescan."""
+
+    finished = pyqtSignal(bool, str)  # available, ssid ("" = not connected)
+
+    def run(self):
+        try:
+            result = subprocess.run(
+                ["nmcli", "-t", "-f", "IN-USE,SSID",
+                 "device", "wifi", "list", "--rescan", "no"],
+                capture_output=True, text=True, timeout=10,
+            )
+            ssid = ""
+            for line in result.stdout.splitlines():
+                parts = _split_nmcli(line)
+                if len(parts) >= 2 and parts[0].strip() == "*":
+                    ssid = parts[1].strip()
+                    break
+            self.finished.emit(result.returncode == 0, ssid)
+        except (OSError, subprocess.SubprocessError):
+            self.finished.emit(False, "")
+
+
 class WiFiScanWorker(QObject):
     """Scans for available WiFi networks using nmcli."""
 
@@ -576,9 +605,7 @@ class WiFiScanWorker(QObject):
             networks = []
             seen = set()
             for line in result.stdout.strip().splitlines():
-                # Terse mode escapes ':' and '\\' inside values (SSIDs!)
-                parts = [re.sub(r"\\(.)", r"\1", p)
-                         for p in re.split(r"(?<!\\):", line)]
+                parts = _split_nmcli(line)
                 if len(parts) < 4:
                     continue
                 in_use = parts[0].strip() == "*"
