@@ -423,7 +423,7 @@ class MainWindow(QMainWindow):
         Rebooting the Pi used to be the only way out of a state where
         refreshes silently stopped. Exiting lets systemd (Restart=always)
         relaunch a fresh process; the network itself is looked after by
-        network-watchdog.sh (see pi-network-setup.sh).
+        network-watchdog.sh (see pi-system.sh).
         """
         if (not self.favourites or self._sleeping or self._is_nocturnal()):
             # No refresh is expected: don't count this time as a failure.
