@@ -29,11 +29,19 @@ timedatectl set-timezone Europe/Paris
 echo "==> Setting up automatic OS updates..."
 apt-get install -y --no-install-recommends unattended-upgrades
 cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'UUCONF'
+// Must match `apt-cache policy` origins: security lives in the
+// "<codename>-security" suite, and the kernel/firmware come from the
+// "Raspberry Pi Foundation" repo (64-bit OS) — with the old patterns
+// unattended-upgrades silently found nothing to install, ever.
 Unattended-Upgrade::Origins-Pattern {
     "origin=Debian,codename=${distro_codename},label=Debian";
-    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+    "origin=Debian,codename=${distro_codename}-updates,label=Debian";
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Raspberry Pi Foundation,codename=${distro_codename}";
     "origin=Raspbian,codename=${distro_codename},label=Raspbian";
 };
+// Never stop on a config-file prompt
+Dpkg::Options { "--force-confdef"; "--force-confold"; };
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
