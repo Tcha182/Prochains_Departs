@@ -10,12 +10,12 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 - **Direction filtering**: Choose which direction to monitor at each stop
 - **Live countdowns**: Updated every second from SIRI Lite real-time data, computed against the server clock (immune to Pi clock drift)
 - **Favourites**: Saved locally with atomic writes (crash-safe)
-- **Auto-refresh**: Every 1 minute, stops fetched in parallel (pauses 2am-5am)
+- **Auto-refresh**: Every 1 minute, stops fetched in parallel (pauses 2am-5am). A failed refresh is retried after 5, 10, 20 and 40 s instead of waiting a full minute, and the last known departures stay on screen meanwhile
 - **Touch-optimised**: 800x480 layout with kinetic scrolling, tap feedback, and virtual AZERTY keyboard with an accent/symbol layer
 - **Settings screen**: API token, WiFi configuration, theme, sleep delay
 - **WiFi configuration**: Scan and connect to networks via nmcli
 - **Dark/light theme**: Toggle between themes in settings
-- **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake
+- **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake. While asleep the app keeps refreshing every 5 min, so departures show the instant it wakes and the WiFi link never sits idle
 - **Night screen**: During the 2am-5am refresh pause the display sleeps instead of showing stale data, and wakes automatically at 5am
 - **Kiosk mode**: Auto-fullscreen and hidden cursor on Raspberry Pi
 - **Field debugging**: Rotating log file (`app.log`) next to the app
@@ -119,6 +119,7 @@ The Pi is fully autonomous:
 - Hardware watchdog reboots the Pi if it freezes
 - Network hardening (`pi-network-setup.sh`): WiFi power saving off, WiFi reconnects forever, and a network watchdog (every 2 min) that restarts NetworkManager when the IDFM APIs are unreachable, or reboots if the local network stays down ~10 min
 - The app restarts itself if departures haven't refreshed for 15 min while awake
+- **Parametres** shows the running version (commit + date), to check an update actually landed
 
 ### Updating the app
 

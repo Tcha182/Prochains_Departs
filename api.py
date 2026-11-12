@@ -1,5 +1,6 @@
 """API workers using QThread/QObject pattern for SIRI Lite and IDFM open data."""
 
+import functools
 import logging
 import os
 import re
@@ -35,8 +36,9 @@ def set_api_token(token: str) -> None:
 
 
 def _sanitize_odsql(value: str) -> str:
-    """Remove double quotes from a value for safe use in ODSQL where clauses."""
-    return value.replace('"', '')
+    """Make a value safe inside a double-quoted ODSQL string literal:
+    drop quotes, and backslashes (which could escape the closing quote)."""
+    return value.replace('"', '').replace('\\', '')
 
 
 SIRI_URL = "https://prim.iledefrance-mobilites.fr/marketplace/stop-monitoring"
@@ -46,7 +48,7 @@ STOPS_DATASET = "arrets"
 STOP_LINES_DATASET = "arrets-lignes"
 LINES_DATASET = "referentiel-des-lignes"
 
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = (6, 15)  # (connect, read) seconds
 
 
 def _natural_sort_key(text: str):
@@ -55,11 +57,37 @@ def _natural_sort_key(text: str):
 
 
 def _network_error_message(e: requests.RequestException) -> str:
-    """Human-readable message, with a hint when the API key is the problem."""
+    """Short human-readable message for the status bar.
+
+    str(e) for a requests error is a multi-line-long connection-pool dump
+    that doesn't fit an 800px screen; the full detail goes to the log.
+    """
     response = getattr(e, "response", None)
-    if response is not None and response.status_code in (401, 403):
-        return "Cle API invalide - voir Parametres"
-    return f"Erreur réseau: {e}"
+    if response is not None:
+        if response.status_code in (401, 403):
+            return "Clé API invalide - voir Paramètres"
+        if response.status_code == 429:
+            return "Erreur serveur: quota API dépassé"
+        return f"Erreur serveur ({response.status_code})"
+    if isinstance(e, requests.Timeout):  # before ConnectionError: ConnectTimeout is both
+        return "Erreur réseau: délai dépassé"
+    if isinstance(e, requests.ConnectionError):
+        return "Pas de connexion réseau"
+    return "Erreur réseau"
+
+
+def _line_from_record(record: dict) -> LineAtStop:
+    """Build a LineAtStop from a referentiel-des-lignes record."""
+    line_id = record.get("id_line", "")
+    return LineAtStop(
+        line_id=line_id,
+        line_name=record.get("shortname_line") or record.get("name_line") or "",
+        mode=record.get("transportmode") or "",
+        # `or` fallbacks: the API returns null for some lines
+        line_color=record.get("colourweb_hexa") or "FFFFFF",
+        line_text_color=record.get("textcolourweb_hexa") or "000000",
+        route_id=f"IDFM:{line_id}",
+    )
 
 
 def _parse_iso_epoch(iso: str):
@@ -138,7 +166,6 @@ class DepartureWorker(QObject):
             for partial, error in outcomes:
                 results.update(partial)
                 if error:
-                    log.warning("departure fetch failed: %s", error)
                     self.error.emit(error)
 
             self.finished.emit(results)
@@ -167,7 +194,6 @@ class DepartureWorker(QObject):
             # Distribute departures to each favourite based on direction
             results = {}
             for fav in favs:
-                fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
                 stop_norm = normalize(fav.stop_name)
                 matched = [
                     d for d in all_departures
@@ -177,10 +203,13 @@ class DepartureWorker(QObject):
                     and not is_same_place(stop_norm, normalize(d.destination))
                 ]
                 matched.sort(key=lambda d: d.expected_iso or "")
-                results[fav_key] = matched[:5]
+                results[fav.key] = matched[:5]
             return results, None
 
         except requests.RequestException as e:
+            # Full detail goes to the log; the UI gets the short message.
+            log.warning("departure fetch failed (stop %s, line %s): %s",
+                        stop_area_id, line_id, e)
             return {}, _network_error_message(e)
         except (KeyError, ValueError) as e:
             return {}, f"Erreur données: {e}"
@@ -279,24 +308,12 @@ class LineSearchWorker(QObject):
                 resp.raise_for_status()
                 data = resp.json()
 
-            results = []
-            for record in data.get("results", []):
-                line_id = record.get("id_line", "")
-                results.append(LineAtStop(
-                    line_id=line_id,
-                    line_name=record.get("shortname_line") or record.get("name_line") or "",
-                    mode=record.get("transportmode") or "",
-                    # `or` fallbacks: the API returns null for some lines
-                    line_color=record.get("colourweb_hexa") or "FFFFFF",
-                    line_text_color=record.get("textcolourweb_hexa") or "000000",
-                    route_id=f"IDFM:{line_id}",
-                ))
-
+            results = [_line_from_record(r) for r in data.get("results", [])]
             results.sort(key=lambda l: _natural_sort_key(l.line_name))
             self.finished.emit(results, self.search_id)
         except requests.RequestException as e:
             log.warning("line search failed: %s", e)
-            self.error.emit(f"Erreur recherche: {e}")
+            self.error.emit(_network_error_message(e))
             self.finished.emit([], self.search_id)
         except Exception as e:
             log.exception("unexpected error in LineSearchWorker")
@@ -344,7 +361,7 @@ class StopsOnLineWorker(QObject):
             self.finished.emit(results)
         except requests.RequestException as e:
             log.warning("stops-on-line fetch failed: %s", e)
-            self.error.emit(f"Erreur arrets: {e}")
+            self.error.emit(_network_error_message(e))
             self.finished.emit([])
         except Exception as e:
             log.exception("unexpected error in StopsOnLineWorker")
@@ -380,7 +397,7 @@ class ResolveAndProbeWorker(QObject):
                     return
             except requests.RequestException as e:
                 log.warning("stop resolution failed: %s", e)
-                self.error.emit(f"Erreur resolution: {e}")
+                self.error.emit(_network_error_message(e))
                 self.finished.emit("", "", [])
                 return
 
@@ -489,7 +506,7 @@ class StopAreaSearchWorker(QObject):
             self.finished.emit(results, self.search_id)
         except requests.RequestException as e:
             log.warning("stop-name search failed: %s", e)
-            self.error.emit(f"Erreur recherche: {e}")
+            self.error.emit(_network_error_message(e))
             self.finished.emit([], self.search_id)
         except Exception as e:
             log.exception("unexpected error in StopAreaSearchWorker")
@@ -529,23 +546,12 @@ class LineDetailsWorker(QObject):
             resp.raise_for_status()
             data = resp.json()
 
-            results = []
-            for record in data.get("results", []):
-                line_id = record.get("id_line", "")
-                results.append(LineAtStop(
-                    line_id=line_id,
-                    line_name=record.get("shortname_line") or record.get("name_line") or "",
-                    mode=record.get("transportmode") or "",
-                    line_color=record.get("colourweb_hexa") or "FFFFFF",
-                    line_text_color=record.get("textcolourweb_hexa") or "000000",
-                    route_id=f"IDFM:{line_id}",
-                ))
-
+            results = [_line_from_record(r) for r in data.get("results", [])]
             results.sort(key=lambda l: _natural_sort_key(l.line_name))
             self.finished.emit(results)
         except requests.RequestException as e:
             log.warning("line details fetch failed: %s", e)
-            self.error.emit(f"Erreur lignes: {e}")
+            self.error.emit(_network_error_message(e))
             self.finished.emit([])
         except Exception as e:
             log.exception("unexpected error in LineDetailsWorker")
@@ -570,7 +576,9 @@ class WiFiScanWorker(QObject):
             networks = []
             seen = set()
             for line in result.stdout.strip().splitlines():
-                parts = line.split(":")
+                # Terse mode escapes ':' and '\\' inside values (SSIDs!)
+                parts = [re.sub(r"\\(.)", r"\1", p)
+                         for p in re.split(r"(?<!\\):", line)]
                 if len(parts) < 4:
                     continue
                 in_use = parts[0].strip() == "*"
@@ -616,14 +624,14 @@ class WiFiConnectWorker(QObject):
                 cmd += ["password", self.password]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
-                self.finished.emit(True, "Connecte")
+                self.finished.emit(True, "Connecté")
             else:
-                msg = result.stderr.strip() or result.stdout.strip() or "Echec de connexion"
+                msg = result.stderr.strip() or result.stdout.strip() or "Échec de connexion"
                 self.finished.emit(False, msg)
         except FileNotFoundError:
             self.finished.emit(False, "WiFi non disponible")
         except subprocess.TimeoutExpired:
-            self.finished.emit(False, "Delai d'attente depasse")
+            self.finished.emit(False, "Délai d'attente dépassé")
         except OSError as e:
             self.finished.emit(False, str(e))
         except Exception as e:
@@ -643,23 +651,23 @@ class UpdateWorker(QObject):
         try:
             before = self._head()
             result = subprocess.run(
-                ["git", "-C", APP_DIR, "pull"],
+                ["git", "-C", APP_DIR, "pull", "--ff-only"],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:
                 msg = result.stderr.strip() or result.stdout.strip() or "Echec de la mise a jour"
                 log.warning("app update failed: %s", msg)
-                self.finished.emit(False, "Erreur de mise a jour")
+                self.finished.emit(False, "Erreur de mise à jour")
                 return
 
             after = self._head()
             if after and after != before:
                 log.info("app updated %s -> %s", before[:8], after[:8])
-                self.finished.emit(True, "Mise a jour installee, redemarrage...")
+                self.finished.emit(True, "Mise à jour installée, redémarrage...")
             else:
-                self.finished.emit(False, "Deja a jour")
+                self.finished.emit(False, "Déjà à jour")
         except subprocess.TimeoutExpired:
-            self.finished.emit(False, "Delai d'attente depasse")
+            self.finished.emit(False, "Délai d'attente dépassé")
         except OSError as e:
             log.warning("app update check failed: %s", e)
             self.finished.emit(False, "Git non disponible")
@@ -673,6 +681,19 @@ class UpdateWorker(QObject):
             capture_output=True, text=True, timeout=15,
         )
         return result.stdout.strip() if result.returncode == 0 else ""
+
+
+@functools.lru_cache(maxsize=1)
+def app_version() -> str:
+    """Short hash + date of the running code ("a1b2c3d 2026-09-25"), or ""."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", APP_DIR, "log", "-1", "--format=%h %cs"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 # ─── Helper: create and start a worker on a thread ──────────────────────────

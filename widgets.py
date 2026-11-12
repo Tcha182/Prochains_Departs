@@ -16,7 +16,7 @@ from styles import THEME_COLORS, get_theme, Icons, icon_font
 
 TRANSPORT_MODES = [
     ("Bus", "bus", Icons.BUS),
-    ("Metro", "metro", Icons.METRO),
+    ("Métro", "metro", Icons.METRO),
     ("Tramway", "tram", Icons.TRAM),
     ("Train / RER", "rail", Icons.TRAIN),
 ]
@@ -180,14 +180,14 @@ class DepartureCard(QFrame):
 
     def _format_status(self, dep: Departure) -> str:
         if dep.vehicle_at_stop:
-            return "A l'arret"
+            return "À l'arrêt"
         status_map = {
-            "onTime": "A l'heure",
+            "onTime": "À l'heure",
             "delayed": "En retard",
             "early": "En avance",
-            "cancelled": "Annule",
+            "cancelled": "Annulé",
             "noReport": "",
-            "arrived": "Arrive",
+            "arrived": "Arrivé",
         }
         return status_map.get(dep.departure_status, dep.departure_status)
 
@@ -264,7 +264,13 @@ class FavouriteGroup(QFrame):
         layout.addLayout(header_row)
 
         # Departure cards
-        if departures:
+        if departures is None:
+            # Not fetched yet (startup, or every fetch failed so far) —
+            # don't claim there is nothing scheduled.
+            waiting = QLabel("En attente des horaires...")
+            waiting.setObjectName("noDepartureLabel")
+            layout.addWidget(waiting)
+        elif departures:
             for dep in departures[:5]:
                 card = DepartureCard(
                     dep,
@@ -275,7 +281,7 @@ class FavouriteGroup(QFrame):
                 self.cards.append(card)
                 layout.addWidget(card)
         else:
-            no_dep = QLabel("Aucun depart prevu")
+            no_dep = QLabel("Aucun départ prévu")
             no_dep.setObjectName("noDepartureLabel")
             layout.addWidget(no_dep)
 
@@ -319,7 +325,7 @@ class HomeScreen(QWidget):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 4, 12, 4)
 
-        title = QLabel("Prochains departs")
+        title = QLabel("Prochains départs")
         title.setObjectName("headerTitle")
         header_layout.addWidget(title, stretch=1)
 
@@ -361,7 +367,7 @@ class HomeScreen(QWidget):
         layout.addWidget(self.scroll, stretch=1)
 
         # ── Empty state
-        self.empty_label = QLabel("Aucun favori\nAppuyez sur + pour ajouter un arret")
+        self.empty_label = QLabel("Aucun favori\nAppuyez sur + pour ajouter un arrêt")
         self.empty_label.setObjectName("emptyLabel")
         self.empty_label.setAlignment(Qt.AlignCenter)
 
@@ -444,8 +450,7 @@ class HomeScreen(QWidget):
             return
 
         for fav in favourites:
-            fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
-            departures = departure_map.get(fav_key, [])
+            departures = departure_map.get(fav.key)  # None = not fetched yet
             group = FavouriteGroup(fav, departures, edit_mode=self.edit_mode)
             if delete_callback:
                 group.delete_requested.connect(delete_callback)
@@ -461,8 +466,12 @@ class HomeScreen(QWidget):
         for group in self.groups:
             group.update_countdowns()
 
-    def set_updated_time(self, text: str):
+    def set_updated_time(self, text: str, error: bool = False):
         self.updated_label.setText(text)
+        # Errors must stand out from the dim routine status text.
+        self.updated_label.setStyleSheet(
+            f"color: {THEME_COLORS[get_theme()]['countdown_imminent']};"
+            if error else "")
 
     def set_next_refresh(self, text: str):
         self.next_refresh_label.setText(text)
@@ -506,7 +515,7 @@ class SleepOverlay(QWidget):
 # ─── SettingsScreen ──────────────────────────────────────────────────────────
 
 SLEEP_OPTIONS = [5, 10, 30, 0]  # 0 = disabled
-SLEEP_LABELS = {5: "5 min", 10: "10 min", 30: "30 min", 0: "Desactive"}
+SLEEP_LABELS = {5: "5 min", 10: "10 min", 30: "30 min", 0: "Désactivé"}
 
 
 class SettingsScreen(QWidget):
@@ -559,7 +568,7 @@ class SettingsScreen(QWidget):
         back_btn.clicked.connect(self.back_to_home.emit)
         h_layout.addWidget(back_btn)
 
-        title = QLabel("Parametres")
+        title = QLabel("Paramètres")
         title.setObjectName("headerTitle")
         h_layout.addWidget(title, stretch=1)
 
@@ -577,13 +586,13 @@ class SettingsScreen(QWidget):
         content_layout.addWidget(wifi_row)
 
         # API key row
-        api_row = self._make_settings_row("Cle API", Icons.CHEVRON_RIGHT)
+        api_row = self._make_settings_row("Clé API", Icons.CHEVRON_RIGHT)
         api_row.tapped.connect(self._open_api)
         content_layout.addWidget(api_row)
 
         # Theme row
         theme_label = "Sombre" if self._theme == "dark" else "Clair"
-        self.theme_row = self._make_settings_row("Theme", theme_label)
+        self.theme_row = self._make_settings_row("Thème", theme_label)
         self.theme_row.tapped.connect(self._toggle_theme)
         content_layout.addWidget(self.theme_row)
 
@@ -593,11 +602,21 @@ class SettingsScreen(QWidget):
         content_layout.addWidget(self.sleep_row)
 
         # Update row
-        self.update_row = self._make_settings_row("Mise a jour", "Verifier")
+        self.update_row = self._make_settings_row("Mise à jour", "Vérifier")
         self.update_row.tapped.connect(self._on_check_update_pressed)
         content_layout.addWidget(self.update_row)
 
         content_layout.addStretch()
+
+        # Which code is actually running — the first thing to check when
+        # the kiosk misbehaves ("did last night's update land?").
+        from api import app_version
+        version = app_version()
+        if version:
+            version_label = QLabel(f"Version {version}")
+            version_label.setObjectName("statusLabel")
+            version_label.setAlignment(Qt.AlignCenter)
+            content_layout.addWidget(version_label)
         layout.addWidget(content, stretch=1)
 
         self.stack.addWidget(page)
@@ -640,7 +659,7 @@ class SettingsScreen(QWidget):
         if self._update_in_progress:
             return
         self._update_in_progress = True
-        self.update_row._value_label.setText("Verification...")
+        self.update_row._value_label.setText("Vérification...")
         self.update_check_requested.emit()
 
     def on_update_result(self, updated: bool, message: str):
@@ -649,7 +668,7 @@ class SettingsScreen(QWidget):
         if updated:
             return  # app is about to restart, leave the message as-is
         self._update_in_progress = False
-        QTimer.singleShot(3000, lambda: self.update_row._value_label.setText("Verifier"))
+        QTimer.singleShot(3000, lambda: self.update_row._value_label.setText("Vérifier"))
 
     def _open_wifi(self):
         self.wifi_status.setText("Recherche...")
@@ -743,7 +762,7 @@ class SettingsScreen(QWidget):
         self._clear_layout(self.wifi_list_layout)
 
         if not networks:
-            lbl = QLabel("Aucun reseau trouve")
+            lbl = QLabel("Aucun réseau trouvé")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.wifi_list_layout.addWidget(lbl)
@@ -826,7 +845,7 @@ class SettingsScreen(QWidget):
         back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
         h_layout.addWidget(back_btn)
 
-        title = QLabel("Cle API")
+        title = QLabel("Clé API")
         title.setObjectName("headerTitle")
         h_layout.addWidget(title, stretch=1)
 
@@ -838,7 +857,7 @@ class SettingsScreen(QWidget):
         content_layout.setSpacing(12)
 
         # Current key (masked)
-        current_label = QLabel("Cle actuelle")
+        current_label = QLabel("Clé actuelle")
         current_label.setObjectName("settingsLabel")
         content_layout.addWidget(current_label)
 
@@ -847,13 +866,13 @@ class SettingsScreen(QWidget):
         content_layout.addWidget(self.api_current)
 
         # New key input
-        new_label = QLabel("Nouvelle cle")
+        new_label = QLabel("Nouvelle clé")
         new_label.setObjectName("settingsLabel")
         content_layout.addWidget(new_label)
 
         self.api_input = QLineEdit()
         self.api_input.setObjectName("settingsInput")
-        self.api_input.setPlaceholderText("Coller la cle API...")
+        self.api_input.setPlaceholderText("Coller la clé API...")
         content_layout.addWidget(self.api_input)
 
         save_btn = QPushButton("Enregistrer")
@@ -871,7 +890,7 @@ class SettingsScreen(QWidget):
         from api import get_api_token
         token = get_api_token()
         if not token or token == "your-api-token-here":
-            return "Non configure"
+            return "Non configuré"
         return self._mask_token_str(token)
 
     def _on_save_api(self):
@@ -1009,7 +1028,7 @@ class SearchScreen(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._make_header("Ajouter un arret", layout)
+        self._make_header("Ajouter un arrêt", layout)
 
         # Stop-first flow: search a stop by name
         input_container = QWidget()
@@ -1017,7 +1036,7 @@ class SearchScreen(QWidget):
         input_layout.setContentsMargins(8, 8, 8, 0)
         self.stop_search_input = QLineEdit()
         self.stop_search_input.setObjectName("searchInput")
-        self.stop_search_input.setPlaceholderText("Chercher un arret par nom...")
+        self.stop_search_input.setPlaceholderText("Chercher un arrêt par nom...")
         self.stop_search_input.textChanged.connect(self._on_stop_search_text_changed)
         input_layout.addWidget(self.stop_search_input)
         layout.addWidget(input_container)
@@ -1087,7 +1106,7 @@ class SearchScreen(QWidget):
         input_layout.setContentsMargins(8, 4, 8, 4)
         self.search_input = QLineEdit()
         self.search_input.setObjectName("searchInput")
-        self.search_input.setPlaceholderText("Numero de ligne...")
+        self.search_input.setPlaceholderText("Numéro de ligne...")
         self.search_input.textChanged.connect(self._on_search_text_changed)
         input_layout.addWidget(self.search_input)
         layout.addWidget(input_container)
@@ -1129,7 +1148,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.line_results_layout)
 
         if not lines:
-            lbl = QLabel("Aucun resultat")
+            lbl = QLabel("Aucun résultat")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.line_results_layout.addWidget(lbl)
@@ -1169,11 +1188,11 @@ class SearchScreen(QWidget):
 
     def _on_line_selected(self, line: LineAtStop):
         self.selected_line = line
-        self.stop_loading.setText("Chargement des arrets...")
+        self.stop_loading.setText("Chargement des arrêts...")
         self._all_stops = []
         self.stop_filter_input.clear()
         self._clear_layout(self.stop_results_layout)
-        self.stop_step_title.setText(f"Arrets - {line.line_name}")
+        self.stop_step_title.setText(f"Arrêts - {line.line_name}")
         self.stops_on_line_requested.emit(line.route_id)
         self._navigate(2)
 
@@ -1185,7 +1204,7 @@ class SearchScreen(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._make_header("Choisir un arret", layout)
+        self._make_header("Choisir un arrêt", layout)
 
         step_title = QLabel("")
         step_title.setObjectName("stepTitle")
@@ -1197,7 +1216,7 @@ class SearchScreen(QWidget):
         filter_layout.setContentsMargins(8, 4, 8, 4)
         self.stop_filter_input = QLineEdit()
         self.stop_filter_input.setObjectName("searchInput")
-        self.stop_filter_input.setPlaceholderText("Filtrer les arrets...")
+        self.stop_filter_input.setPlaceholderText("Filtrer les arrêts...")
         self.stop_filter_input.textChanged.connect(self._on_stop_filter_changed)
         filter_layout.addWidget(self.stop_filter_input)
         layout.addWidget(filter_container)
@@ -1235,7 +1254,7 @@ class SearchScreen(QWidget):
         filtered = [s for s in self._all_stops if query in normalize(s.stop_name)] if query else self._all_stops
 
         if not filtered:
-            lbl = QLabel("Aucun arret trouve")
+            lbl = QLabel("Aucun arrêt trouvé")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.stop_results_layout.addWidget(lbl)
@@ -1312,7 +1331,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.dir_results_layout)
 
         if not stop_area_id:
-            lbl = QLabel("Erreur de resolution")
+            lbl = QLabel("Erreur de résolution")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.dir_results_layout.addWidget(lbl)
@@ -1360,7 +1379,7 @@ class SearchScreen(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._make_header("Choisir un arret", layout)
+        self._make_header("Choisir un arrêt", layout)
 
         self.stop_search_loading = QLabel("")
         self.stop_search_loading.setObjectName("loadingLabel")
@@ -1430,7 +1449,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.stop_search_results_layout)
 
         if not matches:
-            lbl = QLabel("Aucun arret trouve")
+            lbl = QLabel("Aucun arrêt trouvé")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.stop_search_results_layout.addWidget(lbl)
@@ -1463,7 +1482,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.lines_at_stop_layout)
 
         if not lines:
-            lbl = QLabel("Aucune ligne trouvee")
+            lbl = QLabel("Aucune ligne trouvée")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.lines_at_stop_layout.addWidget(lbl)

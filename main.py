@@ -32,6 +32,13 @@ from styles import DARK_THEME, set_theme, get_theme, load_icon_font
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 480
 AUTO_REFRESH_MS = 1 * 60 * 1000  # 1 minute
+# While asleep, keep fetching at a slower pace: departures are ready the
+# instant the screen wakes, and the WiFi link never sits idle for hours
+# (an idle link is what tends to be dead on wake-up).
+SLEEP_REFRESH_MS = 5 * 60 * 1000
+# After a fully failed fetch, retry quickly instead of waiting a whole
+# refresh period — the first request after a quiet spell often fails once.
+RETRY_DELAYS_S = (5, 10, 20, 40)
 COUNTDOWN_MS = 1000  # 1 second
 KEYBOARD_HEIGHT = 220
 NOCTURNAL_START_HOUR = 2
@@ -101,6 +108,9 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._setup_timers()
         self._detect_kiosk()
+        # A previous instance may have exited (update, crash) while asleep,
+        # leaving the backlight off.
+        self._set_backlight(True)
 
         # Show current state immediately, then fetch data
         self.home.populate(self.favourites, self.departure_map, self._delete_favourite)
@@ -164,8 +174,12 @@ class MainWindow(QMainWindow):
         self.refresh_timer.setInterval(AUTO_REFRESH_MS)
         self.refresh_timer.timeout.connect(self._auto_refresh)
         self.refresh_timer.start()
-        self._last_refresh_time = None
         self._next_refresh_epoch = None
+
+        # Quick retry after a failed fetch (see RETRY_DELAYS_S)
+        self.retry_timer = QTimer(self)
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self._refresh_departures)
         self._departure_error_msg = None
         # Only the latest departure fetch may update the display; an older
         # one finishing late (slow network) must not overwrite it.
@@ -259,9 +273,7 @@ class MainWindow(QMainWindow):
                     and f.destination_name == fav.destination_name)
         ]
         save_favourites(self.favourites)
-        # Remove from departure map
-        fav_key = f"{fav.stop_area_id}_{fav.line_id}_{fav.direction}"
-        self.departure_map.pop(fav_key, None)
+        self.departure_map.pop(fav.key, None)
         self._rebuild_home()
 
     def _rebuild_home(self):
@@ -297,6 +309,9 @@ class MainWindow(QMainWindow):
                 return
             log.warning("departure fetch stuck for %.0fs, starting a new one", running)
 
+        self.retry_timer.stop()
+        self.refresh_timer.start()  # restart the period from this fetch
+        self._next_refresh_epoch = time.time() + self.refresh_timer.interval() / 1000
         self._departure_generation += 1
         generation = self._departure_generation
         self._departure_started_at = time.monotonic()
@@ -305,41 +320,47 @@ class MainWindow(QMainWindow):
             DepartureWorker(list(self.favourites)),
             lambda dep_map, g=generation: self._on_departures_received(dep_map, g),
             on_error=lambda msg, g=generation: self._on_departure_error(msg, g))
-        self.home.set_updated_time("Mise a jour...")
+        self.home.set_updated_time("Mise à jour...")
 
     def _on_departures_received(self, dep_map: dict, generation: int = None):
         if generation is not None and generation != self._departure_generation:
             return  # superseded by a newer fetch
         self._departure_started_at = None
-        if dep_map or not self._departure_error_msg:
+        self.departure_map.update(dep_map)
+        failed = bool(self._departure_error_msg) and not dep_map
+
+        if failed:
+            # Every group failed: keep the real error visible (and whatever
+            # departures we already had) instead of claiming an update.
+            self._departure_failures += 1
+            self.home.set_updated_time(self._departure_error_msg, error=True)
+            self._schedule_retry()
+        else:
             if self._departure_failures:
                 log.info("departures back after %d failed refresh(es)",
                          self._departure_failures)
             self._departure_failures = 0
             self._last_departure_success = time.monotonic()
-        else:
-            self._departure_failures += 1
-        if self._sleeping:
-            return  # fetch finished after we went to sleep: keep the screen clear
-        self.departure_map.update(dep_map)
-        self._last_refresh_time = datetime.now()
-        self._next_refresh_epoch = self._last_refresh_time.timestamp() + AUTO_REFRESH_MS / 1000
-        if not dep_map and self._departure_error_msg:
-            # Every group failed: keep the real error visible instead of
-            # claiming a successful update that fetched nothing.
-            self.home.set_updated_time(self._departure_error_msg)
-        else:
             self.home.set_updated_time(
-                f"Mis a jour a {self._last_refresh_time.strftime('%H:%M')}"
-            )
+                f"Mis à jour à {datetime.now().strftime('%H:%M')}",
+                error=False)
         self._rebuild_home()
 
     def _on_departure_error(self, msg: str, generation: int = None):
         if generation is not None and generation != self._departure_generation:
             return
         self._departure_error_msg = msg
-        if not self._sleeping:
-            self.home.set_updated_time(msg)
+        self.home.set_updated_time(msg, error=True)
+
+    def _schedule_retry(self):
+        """Retry a failed fetch soon, backing off; after the last quick
+        attempt the regular refresh timer takes over."""
+        attempt = self._departure_failures
+        if self._sleeping or self._is_nocturnal() or attempt > len(RETRY_DELAYS_S):
+            return
+        delay = RETRY_DELAYS_S[attempt - 1]
+        self.retry_timer.start(delay * 1000)
+        self._next_refresh_epoch = time.time() + delay
 
     @staticmethod
     def _is_nocturnal() -> bool:
@@ -421,12 +442,11 @@ class MainWindow(QMainWindow):
         self._sleeping = True
         self._nocturnal_sleep = (self._is_nocturnal()
                                  and self._settings.sleep_delay_minutes == 0)
-        self.refresh_timer.stop()
+        # Keep refreshing, slowly (see SLEEP_REFRESH_MS). Only the
+        # per-second countdown repaint is pointless under the overlay.
+        self.retry_timer.stop()
+        self.refresh_timer.start(SLEEP_REFRESH_MS)
         self.countdown_timer.stop()
-        # Clear stale departures so they aren't visible under the overlay
-        self.departure_map.clear()
-        self._rebuild_home()
-        self.home.set_updated_time("")
         self.sleep_overlay.setGeometry(self.rect())
         self.sleep_overlay.show()
         self.sleep_overlay.raise_()
@@ -437,10 +457,12 @@ class MainWindow(QMainWindow):
         self._sleeping = False
         self._nocturnal_sleep = False
         self._last_interaction_time = time.monotonic()
-        self.home.set_updated_time("Chargement...")
-        self.sleep_overlay.hide()
-        self.refresh_timer.start()
+        self.refresh_timer.setInterval(AUTO_REFRESH_MS)
         self.countdown_timer.start()
+        # Rebuild before revealing: cards for departures that left while
+        # asleep drop out, so nothing stale flashes on screen.
+        self._rebuild_home()
+        self.sleep_overlay.hide()
         self._set_backlight(True)
         self._refresh_departures(force=True)
 

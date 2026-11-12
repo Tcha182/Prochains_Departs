@@ -735,14 +735,14 @@ class TestDepartureCard:
                         expected_iso="", departure_status="onTime",
                         fetch_timestamp=time.time(), eta_seconds=300)
         card = DepartureCard(dep)
-        assert card.status_label.text() == "A l'heure"
+        assert card.status_label.text() == "À l'heure"
 
     def test_status_vehicle_at_stop(self):
         dep = Departure(line_name="259", line_id="X", destination="Test",
                         expected_iso="", vehicle_at_stop=True,
                         fetch_timestamp=time.time(), eta_seconds=60)
         card = DepartureCard(dep)
-        assert card.status_label.text() == "A l'arret"
+        assert card.status_label.text() == "À l'arrêt"
 
     def test_status_delayed(self):
         dep = Departure(line_name="259", line_id="X", destination="Test",
@@ -756,7 +756,7 @@ class TestDepartureCard:
                         expected_iso="", departure_status="cancelled",
                         fetch_timestamp=time.time(), eta_seconds=300)
         card = DepartureCard(dep)
-        assert card.status_label.text() == "Annule"
+        assert card.status_label.text() == "Annulé"
 
     def test_clock_time_display(self):
         iso = "2025-06-15T14:35:00+02:00"
@@ -777,13 +777,13 @@ class TestFavouriteGroup:
     def test_no_departures_message(self, sample_favourite):
         group = FavouriteGroup(sample_favourite, [])
         assert len(group.cards) == 0
-        # Should contain "Aucun depart" label
+        # Should contain "Aucun départ" label
         found = False
         for i in range(group.layout().count()):
             w = group.layout().itemAt(i).widget()
-            if w and hasattr(w, "text") and "Aucun depart" in w.text():
+            if w and hasattr(w, "text") and "Aucun départ" in w.text():
                 found = True
-        assert found, "Should show 'Aucun depart' when no departures"
+        assert found, "Should show 'Aucun départ' when no departures"
 
     def test_max_5_cards(self, sample_favourite):
         deps = [
@@ -980,7 +980,7 @@ class TestSearchScreen:
         found = False
         for i in range(screen.line_results_layout.count()):
             w = screen.line_results_layout.itemAt(i).widget()
-            if w and hasattr(w, "text") and "Aucun resultat" in w.text():
+            if w and hasattr(w, "text") and "Aucun résultat" in w.text():
                 found = True
         assert found
 
@@ -1017,7 +1017,7 @@ class TestSearchScreen:
         found = False
         for i in range(screen.stop_results_layout.count()):
             w = screen.stop_results_layout.itemAt(i).widget()
-            if w and hasattr(w, "text") and "Aucun arret" in w.text():
+            if w and hasattr(w, "text") and "Aucun arrêt" in w.text():
                 found = True
         assert found
 
@@ -1600,7 +1600,7 @@ class TestApiKeyError:
         errors = []
         worker.error.connect(errors.append)
         worker.run()
-        assert errors == ["Cle API invalide - voir Parametres"]
+        assert errors == ["Clé API invalide - voir Paramètres"]
 
     @patch("api.requests.get")
     def test_other_http_error_keeps_generic_message(self, mock_get):
@@ -2183,3 +2183,140 @@ class TestSearchErrorFlag:
         s._had_error = True
         s.reset()
         assert not s._had_error
+
+
+class TestWakeUpShowsDepartures:
+    """Regressions for 'woke the screen, no departures until a reboot'."""
+
+    @staticmethod
+    def _window(sample_favourite):
+        import main
+        with patch("main.load_favourites", return_value=[sample_favourite]):
+            return main.MainWindow()
+
+    def test_sleep_keeps_refreshing_slowly(self, sample_favourite):
+        import main
+        w = self._window(sample_favourite)
+        with patch("main.datetime") as mock_dt:
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._enter_sleep()
+        assert w.refresh_timer.isActive()
+        assert w.refresh_timer.interval() == main.SLEEP_REFRESH_MS
+        assert not w.countdown_timer.isActive()
+        with patch.object(w, "_launch_worker"):
+            w._wake_up()
+        assert w.refresh_timer.interval() == main.AUTO_REFRESH_MS
+        assert w.countdown_timer.isActive()
+        w.close()
+
+    def test_departures_survive_sleep(self, sample_favourite, sample_departure):
+        """Known departures are shown immediately on wake, even if the
+        wake-up fetch then fails."""
+        w = self._window(sample_favourite)
+        w.departure_map = {sample_favourite.key: [sample_departure]}
+        with patch("main.datetime") as mock_dt, patch.object(w, "_launch_worker"):
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._enter_sleep()
+            w._wake_up()
+            w._on_departure_error("Pas de connexion réseau", w._departure_generation)
+            w._on_departures_received({}, w._departure_generation)
+        assert len(w.home.groups[0].cards) == 1
+        assert w.home.updated_label.text() == "Pas de connexion réseau"
+        w.close()
+
+    def test_fetch_during_sleep_updates_data(self, sample_favourite, sample_departure):
+        w = self._window(sample_favourite)
+        with patch("main.datetime") as mock_dt, patch.object(w, "_launch_worker"):
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._enter_sleep()
+            w._refresh_departures()
+            w._on_departures_received({sample_favourite.key: [sample_departure]},
+                                      w._departure_generation)
+        assert sample_favourite.key in w.departure_map
+        w.close()
+
+    def test_failed_fetch_retries_quickly_then_backs_off(self, sample_favourite):
+        import main
+        w = self._window(sample_favourite)
+        with patch("main.datetime") as mock_dt, patch.object(w, "_launch_worker"):
+            mock_dt.now.return_value = MagicMock(hour=14)
+            for delay in main.RETRY_DELAYS_S:
+                w._refresh_departures(force=True)
+                assert not w.retry_timer.isActive()
+                w._on_departure_error("Pas de connexion réseau", w._departure_generation)
+                w._on_departures_received({}, w._departure_generation)
+                assert w.retry_timer.isActive()
+                assert w.retry_timer.interval() == delay * 1000
+            # Quick attempts exhausted: the regular refresh timer takes over
+            w._refresh_departures(force=True)
+            w._on_departure_error("Pas de connexion réseau", w._departure_generation)
+            w._on_departures_received({}, w._departure_generation)
+            assert not w.retry_timer.isActive()
+            assert w.refresh_timer.isActive()
+        w.close()
+
+    def test_success_resets_retry_backoff(self, sample_favourite, sample_departure):
+        w = self._window(sample_favourite)
+        with patch("main.datetime") as mock_dt, patch.object(w, "_launch_worker"):
+            mock_dt.now.return_value = MagicMock(hour=14)
+            w._refresh_departures(force=True)
+            w._on_departure_error("x", w._departure_generation)
+            w._on_departures_received({}, w._departure_generation)
+            w._refresh_departures(force=True)
+            w._on_departures_received({sample_favourite.key: [sample_departure]},
+                                      w._departure_generation)
+        assert w._departure_failures == 0
+        assert not w.retry_timer.isActive()
+        assert w.home.updated_label.text().startswith("Mis à jour")
+        w.close()
+
+    def test_unfetched_favourite_does_not_claim_no_departures(self, sample_favourite):
+        texts = lambda g: [g.layout().itemAt(i).widget().text()
+                           for i in range(g.layout().count())
+                           if g.layout().itemAt(i).widget()]
+        assert "En attente des horaires..." in texts(FavouriteGroup(sample_favourite, None))
+        assert "Aucun départ prévu" in texts(FavouriteGroup(sample_favourite, []))
+
+
+class TestErrorMessages:
+    def test_messages_are_short_and_specific(self):
+        import requests as req
+        from api import _network_error_message
+        long_detail = "HTTPSConnectionPool(host='prim.iledefrance-mobilites.fr') " * 5
+        assert _network_error_message(req.ConnectionError(long_detail)) == "Pas de connexion réseau"
+        assert "délai" in _network_error_message(req.ConnectTimeout(long_detail))
+        assert "délai" in _network_error_message(req.ReadTimeout(long_detail))
+        resp = MagicMock(status_code=429)
+        assert "quota" in _network_error_message(req.HTTPError(response=resp))
+
+    def test_odsql_sanitize_strips_quotes_and_backslashes(self):
+        from api import _sanitize_odsql
+        assert _sanitize_odsql('gare "du" nord\\') == "gare du nord"
+
+
+class TestWiFiScanParsing:
+    @patch("api.subprocess.run")
+    def test_ssid_with_escaped_colon(self, mock_run):
+        from api import WiFiScanWorker
+        mock_run.return_value = MagicMock(
+            stdout="*:Box\\:Salon:72:WPA2\n :Voisin:40:WPA1 WPA2\n", returncode=0)
+        worker = WiFiScanWorker()
+        got = []
+        worker.finished.connect(got.append)
+        worker.run()
+        assert [(n["ssid"], n["signal"], n["in_use"]) for n in got[0]] == [
+            ("Box:Salon", 72, True), ("Voisin", 40, False)]
+
+
+class TestFavouriteModel:
+    def test_key(self, sample_favourite):
+        f = sample_favourite
+        assert f.key == f"{f.stop_area_id}_{f.line_id}_{f.direction}"
+
+    def test_load_ignores_unknown_fields(self, tmp_path):
+        path = tmp_path / "favs.json"
+        path.write_text(json.dumps([{
+            "stop_area_id": "1", "stop_name": "A", "line_id": "L", "line_name": "1",
+            "added_by_future_version": True}]), encoding="utf-8")
+        with patch("models.FAVOURITES_PATH", str(path)):
+            assert len(load_favourites()) == 1

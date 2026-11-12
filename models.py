@@ -36,6 +36,11 @@ class Favourite:
     direction: str = ""
     destination_name: str = ""
 
+    @property
+    def key(self) -> str:
+        """Identifies this favourite's entry in the departure map."""
+        return f"{self.stop_area_id}_{self.line_id}_{self.direction}"
+
 
 @dataclass
 class Departure:
@@ -81,8 +86,10 @@ def load_favourites() -> List[Favourite]:
     try:
         with open(FAVOURITES_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return [Favourite(**item) for item in data]
-    except (json.JSONDecodeError, TypeError, KeyError):
+        fields = Favourite.__dataclass_fields__
+        return [Favourite(**{k: v for k, v in item.items() if k in fields})
+                for item in data]
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
         return []
 
 
@@ -112,7 +119,7 @@ def load_settings() -> AppSettings:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         return AppSettings(**{k: v for k, v in data.items() if k in AppSettings.__dataclass_fields__})
-    except (json.JSONDecodeError, TypeError, KeyError):
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
         return AppSettings()
 
 
@@ -128,7 +135,10 @@ def save_api_token(token: str) -> None:
     """Write API token to .env file and update runtime variable."""
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     tmp_path = env_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    token = "".join(token.split())  # a stray newline would corrupt the file
+    # Owner-only: the token is a secret (no-op on Windows).
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(f"API_TOKEN={token}\n")
     os.replace(tmp_path, env_path)
     from api import set_api_token

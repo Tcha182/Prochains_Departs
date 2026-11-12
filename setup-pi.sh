@@ -17,17 +17,14 @@ apt-get update && apt-get install -y --no-install-recommends \
     x11-xserver-utils \
     network-manager \
     python3-pyqt5 \
+    python3-requests \
+    python3-dotenv \
+    iw \
+    curl \
     git
 
 echo "==> Setting timezone..."
 timedatectl set-timezone Europe/Paris
-
-echo "==> Installing uv..."
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="/root/.local/bin:$PATH"
-
-echo "==> Installing Python dependencies..."
-uv pip install --system --break-system-packages requests python-dotenv
 
 echo "==> Setting up automatic OS updates..."
 apt-get install -y --no-install-recommends unattended-upgrades
