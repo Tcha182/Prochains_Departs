@@ -28,6 +28,9 @@ class Icons:
     LOCK = "\ue897"         # lock
     CHECK = "\ue5ca"        # check
     MOON = "\ue3a8"         # brightness_3
+    WARNING = "\ue002"      # warning
+    ARROW_UP = "\ue5d8"     # arrow_upward
+    ARROW_DOWN = "\ue5db"   # arrow_downward
 
 
 def load_icon_font():
@@ -56,9 +59,9 @@ _SETTINGS_QSS_DARK = """
     background-color: transparent;
     border: 1px solid #30363d;
     border-radius: 10px;
-    padding: 10px 14px;
-    margin: 3px 8px;
-    min-height: 48px;
+    padding: 8px 14px;
+    margin: 2px 8px;
+    min-height: 36px;
 }
 #settingsLabel {
     color: #e6edf3;
@@ -146,9 +149,9 @@ _SETTINGS_QSS_LIGHT = """
     background-color: transparent;
     border: 1px solid #d0d7de;
     border-radius: 10px;
-    padding: 10px 14px;
-    margin: 3px 8px;
-    min-height: 48px;
+    padding: 8px 14px;
+    margin: 2px 8px;
+    min-height: 36px;
 }
 #settingsLabel {
     color: #1f2328;
@@ -316,6 +319,38 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     border-radius: 0;
     padding: 8px 8px 4px 8px;
     margin: 0 4px;
+}
+#staleLabel {
+    color: #d29922;
+    font-size: 12px;
+    padding: 0 0 4px 0;
+}
+#trafficLabel {
+    color: #f0b72f;
+    background-color: #2d2410;
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 4px 6px;
+}
+#moveBtn {
+    background-color: #30363d;
+    border: none;
+    border-radius: 6px;
+    color: #e6edf3;
+    min-width: 36px;
+    min-height: 32px;
+}
+#moveBtn:disabled {
+    color: #484f58;
+}
+#headerClock {
+    color: #f0f6fc;
+    font-size: 26px;
+    font-weight: bold;
+}
+#headerDate {
+    color: #8b949e;
+    font-size: 14px;
 }
 #groupHeader {
     color: #8b949e;
@@ -594,6 +629,38 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     border-radius: 0;
     padding: 8px 8px 4px 8px;
     margin: 0 4px;
+}
+#staleLabel {
+    color: #9a6700;
+    font-size: 12px;
+    padding: 0 0 4px 0;
+}
+#trafficLabel {
+    color: #7d4e00;
+    background-color: #fff8c5;
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 4px 6px;
+}
+#moveBtn {
+    background-color: #d0d7de;
+    border: none;
+    border-radius: 6px;
+    color: #1f2328;
+    min-width: 36px;
+    min-height: 32px;
+}
+#moveBtn:disabled {
+    color: #8c959f;
+}
+#headerClock {
+    color: #1f2328;
+    font-size: 26px;
+    font-weight: bold;
+}
+#headerDate {
+    color: #656d76;
+    font-size: 14px;
 }
 #groupHeader {
     color: #656d76;
