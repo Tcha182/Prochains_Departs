@@ -98,6 +98,20 @@ if [ -f "$BOOT_CONFIG" ] && ! grep -q '^dtparam=watchdog=on' "$BOOT_CONFIG"; the
     echo 'dtparam=watchdog=on' >> "$BOOT_CONFIG"
     echo "enabled hardware watchdog (active after next reboot)"
 fi
+# ─── Boot command line ───────────────────────────────────────────────────────
+
+# A first-boot hook (`init=/bin/sh -c "...; exec /sbin/init"`, left by the
+# SD card imager) must not stay in cmdline.txt: it ran on every boot,
+# rewrote the WiFi connection (undoing the settings below), kept the WiFi
+# password on the FAT partition, and is the prime suspect for the kernel
+# panic after the 6.18 kernel update (2026-11). The connection it wrote
+# already lives in /etc/NetworkManager, so WiFi doesn't need it.
+CMDLINE=/boot/firmware/cmdline.txt
+if [ -f "$CMDLINE" ] && grep -q ' init=' "$CMDLINE"; then
+    sed -i -E 's/ init=.*$//' "$CMDLINE"
+    echo "removed init= hook from $CMDLINE"
+fi
+
 put /etc/watchdog.conf 644 << 'EOF'
 watchdog-device = /dev/watchdog
 watchdog-timeout = 15
