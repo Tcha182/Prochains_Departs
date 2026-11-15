@@ -13,7 +13,7 @@ from widgets.common import TappableFrame, make_touch_scroll_area
 
 TRANSPORT_MODES = [
     ("Bus", "bus", Icons.BUS),
-    ("Metro", "metro", Icons.METRO),
+    ("Métro", "metro", Icons.METRO),
     ("Tramway", "tram", Icons.TRAM),
     ("Train / RER", "rail", Icons.TRAIN),
 ]
@@ -120,7 +120,7 @@ class SearchScreen(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._make_header("Ajouter un arret", layout)
+        self._make_header("Ajouter un arrêt", layout)
 
         # Stop-first flow: search a stop by name
         input_container = QWidget()
@@ -128,7 +128,7 @@ class SearchScreen(QWidget):
         input_layout.setContentsMargins(8, 8, 8, 0)
         self.stop_search_input = QLineEdit()
         self.stop_search_input.setObjectName("searchInput")
-        self.stop_search_input.setPlaceholderText("Chercher un arret par nom...")
+        self.stop_search_input.setPlaceholderText("Chercher un arrêt par nom...")
         self.stop_search_input.textChanged.connect(self._on_stop_search_text_changed)
         input_layout.addWidget(self.stop_search_input)
         layout.addWidget(input_container)
@@ -198,7 +198,7 @@ class SearchScreen(QWidget):
         input_layout.setContentsMargins(8, 4, 8, 4)
         self.search_input = QLineEdit()
         self.search_input.setObjectName("searchInput")
-        self.search_input.setPlaceholderText("Numero de ligne...")
+        self.search_input.setPlaceholderText("Numéro de ligne...")
         self.search_input.textChanged.connect(self._on_search_text_changed)
         input_layout.addWidget(self.search_input)
         layout.addWidget(input_container)
@@ -240,7 +240,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.line_results_layout)
 
         if not lines:
-            lbl = QLabel("Aucun resultat")
+            lbl = QLabel("Aucun résultat")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.line_results_layout.addWidget(lbl)
@@ -280,11 +280,11 @@ class SearchScreen(QWidget):
 
     def _on_line_selected(self, line: LineAtStop):
         self.selected_line = line
-        self.stop_loading.setText("Chargement des arrets...")
+        self.stop_loading.setText("Chargement des arrêts...")
         self._all_stops = []
         self.stop_filter_input.clear()
         self._clear_layout(self.stop_results_layout)
-        self.stop_step_title.setText(f"Arrets - {line.line_name}")
+        self.stop_step_title.setText(f"Arrêts - {line.line_name}")
         self.stops_on_line_requested.emit(line.route_id)
         self._navigate(2)
 
@@ -296,7 +296,7 @@ class SearchScreen(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._make_header("Choisir un arret", layout)
+        self._make_header("Choisir un arrêt", layout)
 
         step_title = QLabel("")
         step_title.setObjectName("stepTitle")
@@ -308,7 +308,7 @@ class SearchScreen(QWidget):
         filter_layout.setContentsMargins(8, 4, 8, 4)
         self.stop_filter_input = QLineEdit()
         self.stop_filter_input.setObjectName("searchInput")
-        self.stop_filter_input.setPlaceholderText("Filtrer les arrets...")
+        self.stop_filter_input.setPlaceholderText("Filtrer les arrêts...")
         self.stop_filter_input.textChanged.connect(self._on_stop_filter_changed)
         filter_layout.addWidget(self.stop_filter_input)
         layout.addWidget(filter_container)
@@ -346,7 +346,7 @@ class SearchScreen(QWidget):
         filtered = [s for s in self._all_stops if query in normalize(s.stop_name)] if query else self._all_stops
 
         if not filtered:
-            lbl = QLabel("Aucun arret trouve")
+            lbl = QLabel("Aucun arrêt trouvé")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.stop_results_layout.addWidget(lbl)
@@ -423,7 +423,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.dir_results_layout)
 
         if not stop_area_id:
-            lbl = QLabel("Erreur de resolution")
+            lbl = QLabel("Erreur de résolution")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.dir_results_layout.addWidget(lbl)
@@ -471,7 +471,7 @@ class SearchScreen(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._make_header("Choisir un arret", layout)
+        self._make_header("Choisir un arrêt", layout)
 
         self.stop_search_loading = QLabel("")
         self.stop_search_loading.setObjectName("loadingLabel")
@@ -541,7 +541,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.stop_search_results_layout)
 
         if not matches:
-            lbl = QLabel("Aucun arret trouve")
+            lbl = QLabel("Aucun arrêt trouvé")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.stop_search_results_layout.addWidget(lbl)
@@ -574,7 +574,7 @@ class SearchScreen(QWidget):
         self._clear_layout(self.lines_at_stop_layout)
 
         if not lines:
-            lbl = QLabel("Aucune ligne trouvee")
+            lbl = QLabel("Aucune ligne trouvée")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.lines_at_stop_layout.addWidget(lbl)

@@ -6,14 +6,15 @@ from PyQt5.QtWidgets import (
     QStackedWidget,
 )
 
-from styles import Icons, icon_font
+from styles import THEME_COLORS, get_theme, Icons, icon_font
 from widgets.common import TappableFrame, make_touch_scroll_area
 
 
 SLEEP_OPTIONS = [5, 10, 30, 0]  # 0 = disabled
-SLEEP_LABELS = {5: "5 min", 10: "10 min", 30: "30 min", 0: "Desactive"}
+WIFI_CONNECTED_COLOR = "#2ea043"
+SLEEP_LABELS = {5: "5 min", 10: "10 min", 30: "30 min", 0: "Désactivé"}
 DIM_OPTIONS = [100, 50, 25]  # evening backlight, % of full
-DIM_LABELS = {100: "Desactive", 50: "50 %", 25: "25 %"}
+DIM_LABELS = {100: "Désactivé", 50: "50 %", 25: "25 %"}
 
 
 class SettingsScreen(QWidget):
@@ -69,7 +70,7 @@ class SettingsScreen(QWidget):
         back_btn.clicked.connect(self.back_to_home.emit)
         h_layout.addWidget(back_btn)
 
-        title = QLabel("Parametres")
+        title = QLabel("Paramètres")
         title.setObjectName("headerTitle")
         h_layout.addWidget(title, stretch=1)
 
@@ -78,22 +79,26 @@ class SettingsScreen(QWidget):
         # Settings rows
         content = QWidget()
         content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 12, 0, 12)
-        content_layout.setSpacing(6)
+        content_layout.setContentsMargins(0, 8, 0, 4)
+        content_layout.setSpacing(4)
 
         # WiFi row
         wifi_row = self._make_settings_row("WiFi", Icons.CHEVRON_RIGHT)
         wifi_row.tapped.connect(self._open_wifi)
+        # Connection state, shown right on the row (before the chevron)
+        self.wifi_row_status = QLabel("")
+        self.wifi_row_status.setObjectName("settingsValue")
+        wifi_row.layout().insertWidget(1, self.wifi_row_status)
         content_layout.addWidget(wifi_row)
 
         # API key row
-        api_row = self._make_settings_row("Cle API", Icons.CHEVRON_RIGHT)
+        api_row = self._make_settings_row("Clé API", Icons.CHEVRON_RIGHT)
         api_row.tapped.connect(self._open_api)
         content_layout.addWidget(api_row)
 
         # Theme row
         theme_label = "Sombre" if self._theme == "dark" else "Clair"
-        self.theme_row = self._make_settings_row("Theme", theme_label)
+        self.theme_row = self._make_settings_row("Thème", theme_label)
         self.theme_row.tapped.connect(self._toggle_theme)
         content_layout.addWidget(self.theme_row)
 
@@ -104,16 +109,26 @@ class SettingsScreen(QWidget):
 
         # Evening dimming row
         self.dim_row = self._make_settings_row(
-            "Luminosite le soir", DIM_LABELS.get(self._dim, f"{self._dim} %"))
+            "Luminosité le soir", DIM_LABELS.get(self._dim, f"{self._dim} %"))
         self.dim_row.tapped.connect(self._cycle_dim)
         content_layout.addWidget(self.dim_row)
 
         # Update row
-        self.update_row = self._make_settings_row("Mise a jour", "Verifier")
+        self.update_row = self._make_settings_row("Mise à jour", "Vérifier")
         self.update_row.tapped.connect(self._on_check_update_pressed)
         content_layout.addWidget(self.update_row)
 
         content_layout.addStretch()
+
+        # Which code is actually running — the first thing to check when
+        # the kiosk misbehaves ("did last night's update land?").
+        from api import app_version
+        version = app_version()
+        if version:
+            version_label = QLabel(f"Version {version}")
+            version_label.setObjectName("statusLabel")
+            version_label.setAlignment(Qt.AlignCenter)
+            content_layout.addWidget(version_label)
         layout.addWidget(content, stretch=1)
 
         self.stack.addWidget(page)
@@ -165,7 +180,7 @@ class SettingsScreen(QWidget):
         if self._update_in_progress:
             return
         self._update_in_progress = True
-        self.update_row._value_label.setText("Verification...")
+        self.update_row._value_label.setText("Vérification...")
         self.update_check_requested.emit()
 
     def on_update_result(self, updated: bool, message: str):
@@ -174,7 +189,19 @@ class SettingsScreen(QWidget):
         if updated:
             return  # app is about to restart, leave the message as-is
         self._update_in_progress = False
-        QTimer.singleShot(3000, lambda: self.update_row._value_label.setText("Verifier"))
+        QTimer.singleShot(3000, lambda: self.update_row._value_label.setText("Vérifier"))
+
+    def set_wifi_status(self, available: bool, ssid: str):
+        """Show which network the Pi is on, on the WiFi row and page."""
+        if not available:
+            text, color = "Non disponible", ""
+        elif ssid:
+            text, color = f"Connecté · {ssid}", WIFI_CONNECTED_COLOR
+        else:
+            text = "Non connecté"
+            color = THEME_COLORS[get_theme()]["countdown_imminent"]
+        self.wifi_row_status.setText(text)
+        self.wifi_row_status.setStyleSheet(f"color: {color};" if color else "")
 
     def _open_wifi(self):
         self.wifi_status.setText("Recherche...")
@@ -264,11 +291,15 @@ class SettingsScreen(QWidget):
 
     def on_wifi_scan_results(self, networks: list):
         """Called from main window when scan results arrive."""
-        self.wifi_status.setText("")
+        current = next((n["ssid"] for n in networks if n["in_use"]), "")
+        self.wifi_status.setText(f"Connecté à {current}" if current
+                                 else "Non connecté - choisissez un réseau")
+        if networks and networks[0]["signal"] > 0 or current:
+            self.set_wifi_status(True, current)
         self._clear_layout(self.wifi_list_layout)
 
         if not networks:
-            lbl = QLabel("Aucun reseau trouve")
+            lbl = QLabel("Aucun réseau trouvé")
             lbl.setObjectName("noDepartureLabel")
             lbl.setAlignment(Qt.AlignCenter)
             self.wifi_list_layout.addWidget(lbl)
@@ -285,12 +316,17 @@ class SettingsScreen(QWidget):
             if net["in_use"]:
                 check = QLabel(Icons.CHECK)
                 check.setFont(icon_font(16))
-                check.setStyleSheet("color: #238636;")
+                check.setStyleSheet(f"color: {WIFI_CONNECTED_COLOR};")
                 item_layout.addWidget(check)
 
             ssid_label = QLabel(net["ssid"])
             ssid_label.setObjectName("settingsLabel")
             item_layout.addWidget(ssid_label, stretch=1)
+
+            if net["in_use"]:
+                connected = QLabel("Connecté")
+                connected.setStyleSheet(f"color: {WIFI_CONNECTED_COLOR}; font-weight: bold;")
+                item_layout.addWidget(connected)
 
             # Lock icon for secured networks
             if net["security"] and net["security"] != "--":
@@ -351,7 +387,7 @@ class SettingsScreen(QWidget):
         back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
         h_layout.addWidget(back_btn)
 
-        title = QLabel("Cle API")
+        title = QLabel("Clé API")
         title.setObjectName("headerTitle")
         h_layout.addWidget(title, stretch=1)
 
@@ -363,7 +399,7 @@ class SettingsScreen(QWidget):
         content_layout.setSpacing(12)
 
         # Current key (masked)
-        current_label = QLabel("Cle actuelle")
+        current_label = QLabel("Clé actuelle")
         current_label.setObjectName("settingsLabel")
         content_layout.addWidget(current_label)
 
@@ -372,13 +408,13 @@ class SettingsScreen(QWidget):
         content_layout.addWidget(self.api_current)
 
         # New key input
-        new_label = QLabel("Nouvelle cle")
+        new_label = QLabel("Nouvelle clé")
         new_label.setObjectName("settingsLabel")
         content_layout.addWidget(new_label)
 
         self.api_input = QLineEdit()
         self.api_input.setObjectName("settingsInput")
-        self.api_input.setPlaceholderText("Coller la cle API...")
+        self.api_input.setPlaceholderText("Coller la clé API...")
         content_layout.addWidget(self.api_input)
 
         save_btn = QPushButton("Enregistrer")
@@ -396,7 +432,7 @@ class SettingsScreen(QWidget):
         from api import get_api_token
         token = get_api_token()
         if not token or token == "your-api-token-here":
-            return "Non configure"
+            return "Non configuré"
         return self._mask_token_str(token)
 
     def _on_save_api(self):

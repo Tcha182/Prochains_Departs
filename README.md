@@ -12,14 +12,14 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 - **Clock**: Time and date in the home screen header
 - **Live countdowns**: Updated every second from SIRI Lite real-time data, computed against the server clock (immune to Pi clock drift)
 - **Favourites**: Saved locally with atomic writes (crash-safe); reorder them with the arrows in edit mode. An unreadable `favourites.json` is kept aside as `favourites.json.corrupt-<date>` instead of being overwritten
-- **Clear status**: Cancelled trains show "Annule" instead of a countdown; a stop whose last refresh failed is flagged "Donnees non actualisees"
-- **Auto-refresh**: Every 1 minute, stops fetched in parallel (pauses 2am-5am)
+- **Clear status**: Cancelled trains show "Annulé" instead of a countdown; a stop whose last refresh failed is flagged "Données non actualisées"
+- **Auto-refresh**: Every 1 minute, stops fetched in parallel (pauses 2am-5am). A failed refresh is retried after 5, 10, 20 and 40 s instead of waiting a full minute, and the last known departures stay on screen meanwhile
 - **Touch-optimised**: 800x480 layout with kinetic scrolling, tap feedback, and virtual AZERTY keyboard with an accent/symbol layer
 - **Settings screen**: API token, WiFi configuration, theme, sleep delay, evening brightness
 - **Evening dimming**: Backlight lowered to 50 % (or 25 %, or off) between 21h and 7h
 - **WiFi configuration**: Scan and connect to networks via nmcli
 - **Dark/light theme**: Toggle between themes in settings
-- **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake
+- **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake. While asleep the app keeps refreshing every 5 min, so departures show the instant it wakes and the WiFi link never sits idle
 - **Night screen**: During the 2am-5am refresh pause the display sleeps instead of showing stale data, and wakes automatically at 5am
 - **Kiosk mode**: Auto-fullscreen and hidden cursor on Raspberry Pi
 - **Field debugging**: Rotating log file (`app.log`) next to the app
@@ -119,36 +119,28 @@ The Pi is fully autonomous:
 - Auto-login on tty1, starts X11 with Openbox
 - App launches via systemd (`departure-display.service`, `After=multi-user.target`)
 - Restarts automatically if it crashes (`Restart=always`) or hangs (systemd watchdog, `WatchdogSec=120` — the app pings every 30s)
-- App updates from GitHub about a minute after boot and daily at 3:30am (only restarts if code changed; never delays boot)
-- OS security updates install daily, auto-reboot at 4am if needed
+- App **and system config** update from GitHub about a minute after boot and daily at 3:30am (app only restarts if code changed; never delays boot)
+- OS updates (Debian security + Raspberry Pi kernel/firmware) install daily, auto-reboot at 4am if needed
 - Hardware watchdog reboots the Pi if it freezes
-- Network hardening (`pi-network-setup.sh`): WiFi power saving off, WiFi reconnects forever, and a network watchdog (every 2 min) that restarts NetworkManager when the IDFM APIs are unreachable, or reboots if the local network stays down ~10 min
+- Network hardening: WiFi power saving off, WiFi reconnects forever, and a network watchdog (every 2 min) that restarts NetworkManager when the IDFM APIs are unreachable, or reboots if the local network stays down ~10 min
 - The app restarts itself if departures haven't refreshed for 15 min while awake
+- **Paramètres** shows the running version (commit + date), to check an update actually landed
 
-### Updating the app
+### Updating the app and the system
 
-The app automatically checks for updates about a minute after each boot and daily at 3:30am (via a systemd timer, so boot never waits on it). If new code is found on GitHub, it fast-forwards and restarts the service; if the network is down or the fetch fails, it keeps running the current version and retries next time. OS security patches are also automatic (via `unattended-upgrades`).
+Everything the Pi needs lives in the repo:
 
-You can also trigger a check on demand from **Parametres > Mise a jour** on the touchscreen: it pulls from GitHub and, if there's new code, exits so `Restart=always` relaunches the app with it.
+- **`update.sh`** — run by `app-update.timer` about a minute after each boot and nightly at 3:30am. Fast-forwards to GitHub's `main`, then runs `pi-system.sh`, then restarts the app if the code changed. Offline or diverged checkout: keeps the current version and retries next time.
+- **`pi-system.sh`** — the whole system configuration (packages, systemd units, watchdogs, WiFi hardening, unattended-upgrades). Idempotent: files are only rewritten, and services only reloaded, when their content changes.
 
-To update manually via SSH:
+So a change to the system config is deployed exactly like a code change: commit, push, and the Pi applies it at the next update check. No SSH needed.
 
-```bash
-ssh pi@prochains-departs.local
-cd /home/pi/app && ./update.sh
-```
-
-**Pi set up before the network hardening?** Run it once (idempotent):
+You can also trigger an app update from **Paramètres > Mise à jour** on the touchscreen (code only; the system config follows at the next scheduled run), or by SSH:
 
 ```bash
-ssh pi@prochains-departs.local
-cd /home/pi/app && git pull && sudo ./pi-network-setup.sh
+ssh pi@<pi-ip>
+/home/pi/app/update.sh
 ```
-
-Note: the systemd unit is written once at setup time. To pick up unit changes
-(e.g. the watchdog) on an already-deployed Pi, re-run `setup-pi.sh` or edit
-`/etc/systemd/system/departure-display.service` by hand, then
-`sudo systemctl daemon-reload && sudo systemctl restart departure-display`.
 
 ## Project Structure
 
@@ -163,10 +155,10 @@ Note: the systemd unit is written once at setup time. To pick up unit changes
 ├── test_app.py                   Test suite
 ├── requirements.txt              Python dependencies
 ├── .github/workflows/tests.yml   CI: lint + unit tests
-├── setup-pi.sh                   Pi setup script (packages, systemd, watchdog, timezone)
-├── pi-network-setup.sh           Network hardening (WiFi power save off, network watchdog)
+├── setup-pi.sh                   One-time Pi setup (installs git, clones, runs pi-system.sh)
+├── pi-system.sh                  Pi system config, re-applied on every update (idempotent)
+├── update.sh                     Pulls code, applies pi-system.sh, restarts the app
 ├── prepare-sd.ps1                Windows script to prepare SD card for autonomous setup
-├── update.sh                     Created on the Pi by setup-pi.sh — pulls code and restarts
 └── .env                          API token (not committed)
 ```
 

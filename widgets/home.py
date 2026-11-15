@@ -15,9 +15,9 @@ from widgets.common import make_touch_scroll_area
 
 FRENCH_DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi",
                "samedi", "dimanche"]
-FRENCH_MONTHS = ["janvier", "fevrier", "mars", "avril", "mai", "juin",
-                 "juillet", "aout", "septembre", "octobre", "novembre",
-                 "decembre"]
+FRENCH_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin",
+                 "juillet", "août", "septembre", "octobre", "novembre",
+                 "décembre"]
 
 
 class DepartureCard(QFrame):
@@ -98,14 +98,14 @@ class DepartureCard(QFrame):
 
     def _format_status(self, dep: Departure) -> str:
         if dep.vehicle_at_stop:
-            return "A l'arret"
+            return "À l'arrêt"
         status_map = {
-            "onTime": "A l'heure",
+            "onTime": "À l'heure",
             "delayed": "En retard",
             "early": "En avance",
             "cancelled": "",  # shown in place of the countdown instead
             "noReport": "",
-            "arrived": "Arrive",
+            "arrived": "Arrivé",
         }
         return status_map.get(dep.departure_status, dep.departure_status)
 
@@ -127,7 +127,7 @@ class DepartureCard(QFrame):
         elif self.cancelled:
             # No countdown for a train that won't come: it would read as
             # one to catch.
-            self._render_countdown("Annule", "countdown_departed")
+            self._render_countdown("Annulé", "countdown_departed")
         elif remaining < -30:
             self._render_countdown("Parti", "countdown_departed")
         elif remaining < 60:
@@ -201,8 +201,8 @@ class FavouriteGroup(QFrame):
         # Last refresh of this stop failed: the rows below are from an
         # earlier fetch and may miss newly announced trains or delays.
         self.stale_label = None
-        if stale and departures:
-            self.stale_label = QLabel("Donnees non actualisees")
+        if stale and departures is not None:
+            self.stale_label = QLabel("Données non actualisées")
             self.stale_label.setObjectName("staleLabel")
             layout.addWidget(self.stale_label)
 
@@ -215,7 +215,13 @@ class FavouriteGroup(QFrame):
             layout.addWidget(lbl)
 
         # Departure cards
-        if departures:
+        if departures is None:
+            # Not fetched yet (startup, or every fetch failed so far) —
+            # don't claim there is nothing scheduled.
+            waiting = QLabel("En attente des horaires...")
+            waiting.setObjectName("noDepartureLabel")
+            layout.addWidget(waiting)
+        elif departures:
             for dep in departures[:5]:
                 card = DepartureCard(
                     dep,
@@ -226,7 +232,7 @@ class FavouriteGroup(QFrame):
                 self.cards.append(card)
                 layout.addWidget(card)
         else:
-            no_dep = QLabel("Aucun depart prevu")
+            no_dep = QLabel("Aucun départ prévu")
             no_dep.setObjectName("noDepartureLabel")
             layout.addWidget(no_dep)
 
@@ -328,7 +334,7 @@ class HomeScreen(QWidget):
         layout.addWidget(self.scroll, stretch=1)
 
         # ── Empty state
-        self.empty_label = QLabel("Aucun favori\nAppuyez sur + pour ajouter un arret")
+        self.empty_label = QLabel("Aucun favori\nAppuyez sur + pour ajouter un arrêt")
         self.empty_label.setObjectName("emptyLabel")
         self.empty_label.setAlignment(Qt.AlignCenter)
 
@@ -417,7 +423,7 @@ class HomeScreen(QWidget):
         last = len(favourites) - 1
         for i, fav in enumerate(favourites):
             group = FavouriteGroup(
-                fav, departure_map.get(fav.key, []),
+                fav, departure_map.get(fav.key),  # None = not fetched yet
                 edit_mode=self.edit_mode,
                 stale=fav.key in stale_keys,
                 traffic=tuple(traffic.get(fav.line_id, ())),
@@ -446,8 +452,12 @@ class HomeScreen(QWidget):
         self.header_date.setText(
             f"{FRENCH_DAYS[now.weekday()]} {now.day} {FRENCH_MONTHS[now.month - 1]}")
 
-    def set_updated_time(self, text: str):
+    def set_updated_time(self, text: str, error: bool = False):
         self.updated_label.setText(text)
+        # Errors must stand out from the dim routine status text.
+        self.updated_label.setStyleSheet(
+            f"color: {THEME_COLORS[get_theme()]['countdown_imminent']};"
+            if error else "")
 
     def set_next_refresh(self, text: str):
         self.next_refresh_label.setText(text)

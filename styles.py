@@ -59,9 +59,9 @@ _SETTINGS_QSS_DARK = """
     background-color: transparent;
     border: 1px solid #30363d;
     border-radius: 10px;
-    padding: 10px 14px;
-    margin: 3px 8px;
-    min-height: 48px;
+    padding: 8px 14px;
+    margin: 2px 8px;
+    min-height: 36px;
 }
 #settingsLabel {
     color: #e6edf3;
@@ -149,9 +149,9 @@ _SETTINGS_QSS_LIGHT = """
     background-color: transparent;
     border: 1px solid #d0d7de;
     border-radius: 10px;
-    padding: 10px 14px;
-    margin: 3px 8px;
-    min-height: 48px;
+    padding: 8px 14px;
+    margin: 2px 8px;
+    min-height: 36px;
 }
 #settingsLabel {
     color: #1f2328;
