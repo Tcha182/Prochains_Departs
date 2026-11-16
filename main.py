@@ -28,7 +28,11 @@ from api import (
     TrafficWorker,
     start_worker,
 )
-from widgets import HomeScreen, SearchScreen, SettingsScreen, SleepOverlay, VirtualKeyboard
+import ha
+from widgets import (
+    HomeScreen, SearchScreen, SettingsScreen, HeatingScreen, SleepOverlay,
+    VirtualKeyboard,
+)
 from styles import set_theme, load_icon_font
 
 WINDOW_WIDTH = 800
@@ -57,6 +61,13 @@ REFRESH_STALL_SECONDS = 90
 # No successful departure fetch for this long while awake: restart the app
 # (systemd's Restart=always relaunches it) to shed any bad in-process state.
 SELF_RESTART_AFTER_SECONDS = 15 * 60
+HEATING_PAGE = 3  # index of the heating screen in the stack
+HEATING_REFRESH_MS = 20 * 1000  # only while the heating screen is showing
+# After a command, a battery valve takes a few seconds to apply and report
+# it: look again once it most likely has.
+HEATING_CONFIRM_MS = 3 * 1000
+# Left alone on the heating screen, go back to the departures.
+HEATING_IDLE_RETURN_S = 120
 
 log = logging.getLogger("departs.main")
 
@@ -143,6 +154,8 @@ class MainWindow(QMainWindow):
         self.home.refresh_requested.connect(lambda: self._refresh_departures(force=True))
         self.home.edit_toggled.connect(self._rebuild_home)
         self.home.settings_requested.connect(self._show_settings)
+        self.home.heating_requested.connect(self._show_heating)
+        self.home.set_heating_available(ha.is_configured())
         self.stack.addWidget(self.home)
 
         # Search screen (index 1)
@@ -172,6 +185,14 @@ class MainWindow(QMainWindow):
         self.settings_screen.evening_brightness_changed.connect(
             self._on_evening_brightness_changed)
         self.stack.addWidget(self.settings_screen)
+
+        # Heating screen (index 3, HEATING_PAGE)
+        self.heating = HeatingScreen()
+        self.heating.back_to_home.connect(self._show_home)
+        self.heating.refresh_requested.connect(self._refresh_heating)
+        self.heating.temperature_requested.connect(self._on_heating_temperature)
+        self.heating.mode_requested.connect(self._on_heating_mode)
+        self.stack.addWidget(self.heating)
 
         # Virtual keyboard (child widget, overlays at bottom)
         self.keyboard = VirtualKeyboard(self)
@@ -212,6 +233,12 @@ class MainWindow(QMainWindow):
         self.traffic_timer.timeout.connect(self._refresh_traffic)
         self.traffic_timer.start()
         self._traffic_running = False
+
+        # Radiator state: polled only while the heating screen is showing
+        self.heating_timer = QTimer(self)
+        self.heating_timer.setInterval(HEATING_REFRESH_MS)
+        self.heating_timer.timeout.connect(self._refresh_heating)
+        self._heating_running = False
 
         # Countdown timer (1 second)
         self.countdown_timer = QTimer(self)
@@ -268,7 +295,14 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(1)
 
     def _show_home(self):
+        self.heating_timer.stop()
         self.stack.setCurrentIndex(0)
+
+    def _show_heating(self):
+        self.heating.show_loading()
+        self.stack.setCurrentIndex(HEATING_PAGE)
+        self.heating_timer.start()
+        self._refresh_heating()
 
     def _show_settings(self):
         self.settings_screen.stack.setCurrentIndex(0)
@@ -323,7 +357,8 @@ class MainWindow(QMainWindow):
         destroyed while still running (Qt aborts the process if it is)."""
         self._closed = True
         for timer in (self.refresh_timer, self.retry_timer, self.traffic_timer,
-                      self.countdown_timer, self.heartbeat_timer):
+                      self.countdown_timer, self.heartbeat_timer,
+                      self.heating_timer):
             timer.stop()
         for thread in list(self._active_threads):
             thread.quit()
@@ -436,6 +471,31 @@ class MainWindow(QMainWindow):
         self._traffic = traffic
         self._rebuild_home()
 
+    # ── Heating (Home Assistant) ─────────────────────────────────────────────
+
+    def _refresh_heating(self):
+        if self._heating_running or self.stack.currentIndex() != HEATING_PAGE:
+            return
+        self._heating_running = True
+        self._launch_worker(ha.HeatingWorker(), self._on_heating_state)
+
+    def _on_heating_state(self, status: str, radiators: list, detail: str):
+        self._heating_running = False
+        self.heating.set_state(status, radiators, detail)
+
+    def _on_heating_temperature(self, entity_id: str, temperature: float):
+        self._launch_worker(
+            ha.HeatingCommandWorker(entity_id, temperature=temperature),
+            self._on_heating_command_done)
+
+    def _on_heating_mode(self, entity_id: str, mode: str):
+        self._launch_worker(ha.HeatingCommandWorker(entity_id, mode=mode),
+                            self._on_heating_command_done)
+
+    def _on_heating_command_done(self, entity_id: str, success: bool):
+        self.heating.on_command_result(entity_id, success)
+        QTimer.singleShot(HEATING_CONFIRM_MS, self._refresh_heating)
+
     @staticmethod
     def _is_nocturnal() -> bool:
         return NOCTURNAL_START_HOUR <= datetime.now().hour < NOCTURNAL_END_HOUR
@@ -461,6 +521,13 @@ class MainWindow(QMainWindow):
                 self.home.set_next_refresh(f"MaJ dans {mins}:{secs:02d}")
             else:
                 self.home.set_next_refresh("")
+
+        # The heating screen is a detour: once it's left alone, return to
+        # the departures (where the sleep timer applies again).
+        if (self.stack.currentIndex() == HEATING_PAGE and not self._sleeping
+                and time.monotonic() - self._last_interaction_time
+                > HEATING_IDLE_RETURN_S):
+            self._show_home()
 
         # Sleep check. During the nocturnal pause (no refreshes, stale data)
         # the sleep screen always kicks in — even if sleep is disabled, and
@@ -517,6 +584,8 @@ class MainWindow(QMainWindow):
         self._sleeping = True
         self._nocturnal_sleep = (self._is_nocturnal()
                                  and self._settings.sleep_delay_minutes == 0)
+        if self.stack.currentIndex() == HEATING_PAGE:
+            self._show_home()  # wake up on the departures, not the radiators
         # Keep refreshing, slowly (see SLEEP_REFRESH_MS). Only the
         # per-second countdown repaint is pointless under the overlay.
         self.retry_timer.stop()

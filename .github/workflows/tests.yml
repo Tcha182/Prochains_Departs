@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyflakes
       - name: Lint (unused imports, undefined names)
-        run: python -m pyflakes main.py api.py models.py styles.py widgets/
+        run: python -m pyflakes main.py api.py ha.py models.py styles.py widgets/
       - name: Unit tests
         env:
           QT_QPA_PLATFORM: offscreen

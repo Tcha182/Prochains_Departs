@@ -258,6 +258,7 @@ class HomeScreen(QWidget):
     refresh_requested = pyqtSignal()
     edit_toggled = pyqtSignal()
     settings_requested = pyqtSignal()
+    heating_requested = pyqtSignal()
 
     POPULATE_MAX_DEFER_S = 5.0
 
@@ -295,6 +296,15 @@ class HomeScreen(QWidget):
         header_layout.addSpacing(10)
         header_layout.addWidget(self.header_date, stretch=1)
         self.update_clock()
+
+        # Radiators (Home Assistant). Hidden unless the device has one to
+        # talk to: see set_heating_available().
+        self.heating_btn = QPushButton(Icons.THERMOSTAT)
+        self.heating_btn.setObjectName("headerBtn")
+        self.heating_btn.setFont(icon_font(20))
+        self.heating_btn.clicked.connect(self.heating_requested.emit)
+        self.heating_btn.hide()
+        header_layout.addWidget(self.heating_btn)
 
         self.refresh_btn = QPushButton(Icons.REFRESH)
         self.refresh_btn.setObjectName("headerBtn")
@@ -353,6 +363,9 @@ class HomeScreen(QWidget):
         status_layout.addWidget(self.next_refresh_label)
 
         layout.addWidget(status_bar)
+
+    def set_heating_available(self, available: bool):
+        self.heating_btn.setVisible(available)
 
     def _toggle_edit_mode(self):
         self.edit_mode = not self.edit_mode

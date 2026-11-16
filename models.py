@@ -7,7 +7,7 @@ import time
 import re
 import unicodedata
 from dataclasses import dataclass, asdict, field
-from typing import List
+from typing import List, Optional
 
 log = logging.getLogger("departs.models")
 
@@ -85,6 +85,22 @@ class StopAreaMatch:
     stop_name: str
     town: str = ""
     routes: dict = field(default_factory=dict)  # {line_id: stop_id}
+
+
+@dataclass
+class Radiator:
+    """A thermostat (Home Assistant `climate` entity), e.g. a radiator valve."""
+    entity_id: str
+    name: str
+    available: bool = True
+    mode: str = ""                 # HA hvac mode: "heat", "auto", "off"...
+    modes: list = field(default_factory=list)  # modes the device supports
+    current_temp: Optional[float] = None
+    target_temp: Optional[float] = None
+    min_temp: float = 5.0
+    max_temp: float = 30.0
+    step: float = 0.5
+    heating: bool = False          # valve open right now
 
 
 def _set_aside_corrupt(path: str) -> None:
