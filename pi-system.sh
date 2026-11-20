@@ -364,10 +364,12 @@ ha_wanted && HA_WANTED=1
 
 if [ "$HA_WANTED" -eq 1 ]; then
     if ! command -v docker >/dev/null 2>&1; then
-        echo "installing: docker.io"
+        # docker-cli apart: on Debian 13 the `docker` command is no longer
+        # part of docker.io, and --no-install-recommends skips it.
+        echo "installing: docker.io docker-cli"
         export DEBIAN_FRONTEND=noninteractive
         timeout 15m apt-get update -qq \
-            && timeout 30m apt-get install -y -qq --no-install-recommends docker.io \
+            && timeout 30m apt-get install -y -qq --no-install-recommends docker.io docker-cli \
             || echo "docker install failed, will retry next run" >&2
     fi
 fi
