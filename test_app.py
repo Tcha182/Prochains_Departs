@@ -2926,7 +2926,7 @@ class TestRadiatorCard:
     def _signals(self, card):
         temps, modes = [], []
         card.temperature_requested.connect(lambda e, t: temps.append((e, t)))
-        card.mode_requested.connect(lambda e, m: modes.append((e, m)))
+        card.mode_requested.connect(lambda e, m, t: modes.append((e, m, t)))
         return temps, modes
 
     def test_shows_state(self):
@@ -2997,7 +2997,41 @@ class TestRadiatorCard:
         card.mode_btn.click()
         assert card.mode_btn.text() == "Arrêt"
         card._mode_timer.timeout.emit()
-        assert modes == [("climate.salon", "off")]
+        assert modes == [("climate.salon", "off", None)]
+
+    def test_switching_back_on_restores_the_last_target(self):
+        # A valve switched off reports no target and comes back at its
+        # minimum: the card must offer (and send) the previous target.
+        card = RadiatorCard(make_radiator(modes=["heat", "off"], target_temp=19.0))
+        _, modes = self._signals(card)
+        card.mode_btn.click()  # heat -> off
+        card._mode_timer.timeout.emit()
+        card.update_from(make_radiator(modes=["heat", "off"], mode="off",
+                                       target_temp=None))
+        assert card.target_label.text() == "—"
+        card.mode_btn.click()  # off -> heat
+        assert card.target_label.text() == "19,0°"
+        assert card.plus_btn.isEnabled()
+        card._mode_timer.timeout.emit()
+        assert modes[-1] == ("climate.salon", "heat", 19.0)
+
+    def test_switching_on_a_valve_without_history_uses_a_default(self):
+        card = RadiatorCard(make_radiator(modes=["heat", "off"], mode="off",
+                                          target_temp=None))
+        _, modes = self._signals(card)
+        card.mode_btn.click()
+        assert card.target_label.text() == "19,0°"
+        card._mode_timer.timeout.emit()
+        assert modes == [("climate.salon", "heat", 19.0)]
+
+    def test_valve_reporting_its_minimum_does_not_replace_the_target(self):
+        card = RadiatorCard(make_radiator(modes=["heat", "off"], mode="off",
+                                          target_temp=None))
+        card.mode_btn.click()
+        # Home Assistant answers before the target was applied: 4 °C.
+        card.update_from(make_radiator(modes=["heat", "off"], mode="heat",
+                                       target_temp=4.0))
+        assert card.target_label.text() == "19,0°"
 
     def test_full_mode_cycle_sends_nothing(self):
         card = RadiatorCard(make_radiator())

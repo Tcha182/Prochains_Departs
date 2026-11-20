@@ -36,10 +36,13 @@ class RadiatorCard(QFrame):
     """
 
     temperature_requested = pyqtSignal(str, float)  # entity_id, target
-    mode_requested = pyqtSignal(str, str)           # entity_id, hvac mode
+    # entity_id, hvac mode, target to set along with it (float) or None
+    mode_requested = pyqtSignal(str, str, object)
 
     SEND_DELAY_MS = 800
     HOLD_SECONDS = 20
+    # Target offered when switching on a valve that never had one here.
+    DEFAULT_TARGET = 19.0
 
     def __init__(self, radiator: Radiator, parent=None):
         super().__init__(parent)
@@ -47,6 +50,9 @@ class RadiatorCard(QFrame):
         self.radiator = radiator
         self._target = radiator.target_temp
         self._mode = radiator.mode
+        # A valve switched off reports no target, and comes back from "off"
+        # at its minimum (4 °C): keep the last real target to restore it.
+        self._last_target = radiator.target_temp if radiator.mode != "off" else None
         self._hold_until = 0.0  # time.monotonic()
 
         self._temp_timer = QTimer(self)
@@ -106,6 +112,8 @@ class RadiatorCard(QFrame):
             self._hold_until = 0.0
             self._target = radiator.target_temp
             self._mode = radiator.mode
+            if self._mode != "off" and self._target is not None:
+                self._last_target = self._target
         self._render()
 
     def release_hold(self):
@@ -168,6 +176,13 @@ class RadiatorCard(QFrame):
             return
         i = modes.index(self._mode) if self._mode in modes else -1
         self._mode = modes[(i + 1) % len(modes)]
+        if self._mode != "off" and self._target is None:
+            # Show the target (and let it be adjusted) right away, instead
+            # of waiting for the valve to report its own.
+            r = self.radiator
+            wanted = self._last_target if self._last_target is not None \
+                else self.DEFAULT_TARGET
+            self._target = min(max(wanted, r.min_temp), r.max_temp)
         self._hold_until = time.monotonic() + self.HOLD_SECONDS
         self._render()
         self._mode_timer.start()
@@ -179,7 +194,14 @@ class RadiatorCard(QFrame):
     def _send_mode(self):
         # Cycling all the way round to the current mode sends nothing.
         if self._mode and self._mode != self.radiator.mode:
-            self.mode_requested.emit(self.radiator.entity_id, self._mode)
+            # Coming back from "off" the valve picks its minimum: send the
+            # target in the same command, after the mode.
+            temperature = None
+            if (self._mode == "heat" and self._target is not None
+                    and self._target != self.radiator.target_temp):
+                temperature = self._target
+            self.mode_requested.emit(self.radiator.entity_id, self._mode,
+                                     temperature)
 
 
 class HeatingScreen(QWidget):
@@ -188,7 +210,7 @@ class HeatingScreen(QWidget):
     back_to_home = pyqtSignal()
     refresh_requested = pyqtSignal()
     temperature_requested = pyqtSignal(str, float)
-    mode_requested = pyqtSignal(str, str)
+    mode_requested = pyqtSignal(str, str, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)

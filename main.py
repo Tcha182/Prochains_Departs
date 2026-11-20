@@ -488,9 +488,10 @@ class MainWindow(QMainWindow):
             ha.HeatingCommandWorker(entity_id, temperature=temperature),
             self._on_heating_command_done)
 
-    def _on_heating_mode(self, entity_id: str, mode: str):
-        self._launch_worker(ha.HeatingCommandWorker(entity_id, mode=mode),
-                            self._on_heating_command_done)
+    def _on_heating_mode(self, entity_id: str, mode: str, temperature=None):
+        self._launch_worker(
+            ha.HeatingCommandWorker(entity_id, mode=mode, temperature=temperature),
+            self._on_heating_command_done)
 
     def _on_heating_command_done(self, entity_id: str, success: bool):
         self.heating.on_command_result(entity_id, success)
