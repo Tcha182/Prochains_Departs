@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 favourites.json
 settings.json
+ha_auth.json
 debug_output.txt
 app.log
 app.log.*

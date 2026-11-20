@@ -325,6 +325,174 @@ OnUnitActiveSec=2min
 WantedBy=timers.target
 EOF
 
+# ─── Home Assistant (radiators, driven from the touchscreen) ────────────────
+
+# Runs as a container next to the display: the one supported install that
+# leaves the OS, and so the kiosk, alone. The app talks to it on localhost
+# (ha.py); pairing the Zigbee valves and their schedules are done in its
+# own web UI, http://<pi>:8123.
+
+HA_CONFIG_DIR="/home/$PI_USER/homeassistant"
+HA_UNIT=/etc/systemd/system/home-assistant.service
+HA_UNIT_CHANGED=0
+
+# Once installed it stays managed. A first install needs a Pi that can
+# carry it without starving the display.
+ha_wanted() {
+    [ -f "$HA_UNIT" ] && return 0
+    local mem_kb free_kb
+    if [ "$(dpkg --print-architecture)" != "arm64" ]; then
+        echo "Home Assistant not installed: needs the 64-bit OS"
+        return 1
+    fi
+    mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    if [ "${mem_kb:-0}" -lt 1500000 ]; then
+        echo "Home Assistant not installed: needs 2 GB of RAM"
+        return 1
+    fi
+    # The image is 2-4 GB unpacked, and an update holds the old and the
+    # new one side by side until the old one is pruned.
+    free_kb=$(df -k --output=avail / | tail -1 | tr -d ' ')
+    if [ "${free_kb:-0}" -lt 9000000 ]; then
+        echo "Home Assistant not installed: needs 9 GB free on the SD card"
+        return 1
+    fi
+}
+
+HA_WANTED=0
+ha_wanted && HA_WANTED=1
+
+if [ "$HA_WANTED" -eq 1 ]; then
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "installing: docker.io"
+        export DEBIAN_FRONTEND=noninteractive
+        timeout 15m apt-get update -qq \
+            && timeout 30m apt-get install -y -qq --no-install-recommends docker.io \
+            || echo "docker install failed, will retry next run" >&2
+    fi
+fi
+
+if [ "$HA_WANTED" -eq 1 ] && command -v docker >/dev/null 2>&1; then
+    # Starting configuration, written once: from then on the file belongs
+    # to Home Assistant and its owner.
+    if [ ! -f "$HA_CONFIG_DIR/configuration.yaml" ]; then
+        mkdir -p "$HA_CONFIG_DIR"
+        printf '[]\n' > "$HA_CONFIG_DIR/automations.yaml"
+        : > "$HA_CONFIG_DIR/scripts.yaml"
+        : > "$HA_CONFIG_DIR/scenes.yaml"
+        cat > "$HA_CONFIG_DIR/configuration.yaml" << 'EOF'
+# Written once by the departure display's pi-system.sh, never overwritten.
+
+default_config:
+
+homeassistant:
+  auth_providers:
+    - type: homeassistant
+    # Lets the touchscreen app, running on this same Pi, sign in without a
+    # password. Only connections from the Pi itself are trusted.
+    - type: trusted_networks
+      trusted_networks:
+        - 127.0.0.1
+        - ::1
+      allow_bypass_login: true
+
+# Keep a week of history and write it in batches: easier on the SD card.
+recorder:
+  purge_keep_days: 7
+  commit_interval: 30
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+EOF
+        echo "created $HA_CONFIG_DIR/configuration.yaml"
+    fi
+
+    # --privileged and /run/dbus are the documented way to give it the
+    # Zigbee stick and Bluetooth. Half the CPU weight of everything else,
+    # so the display stays smooth while it starts. Its log goes to the
+    # journal through this unit, so Docker keeps no copy (which is never
+    # rotated).
+    put "$HA_UNIT" 644 << 'EOF' && { UNITS_CHANGED=1; HA_UNIT_CHANGED=1; }
+[Unit]
+Description=Home Assistant (container)
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=simple
+# A container left behind by a crash would block the name
+ExecStartPre=-/usr/bin/docker rm -f homeassistant
+ExecStart=/usr/bin/docker run --rm --name homeassistant \
+    --privileged --network=host --cpu-shares=512 --log-driver=none \
+    -e TZ=Europe/Paris \
+    -v /home/pi/homeassistant:/config \
+    -v /run/dbus:/run/dbus:ro \
+    ghcr.io/home-assistant/home-assistant:stable
+ExecStop=/usr/bin/docker stop -t 120 homeassistant
+Restart=always
+RestartSec=30
+# The very first start downloads the image (700 MB, several minutes)
+TimeoutStartSec=0
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # A USB stick plugged in after the container started doesn't exist
+    # inside it. try-restart: does nothing while Home Assistant is stopped
+    # (so nothing at boot, when every device is "added").
+    put /etc/udev/rules.d/99-home-assistant-usb.rules 644 << 'EOF' && udevadm control --reload
+ACTION=="add", SUBSYSTEM=="tty", ENV{ID_BUS}=="usb", RUN+="/usr/bin/systemctl --no-block try-restart home-assistant.service"
+EOF
+
+    put /usr/local/bin/home-assistant-update.sh 755 << 'EOF'
+#!/usr/bin/env bash
+# Installed by pi-system.sh (app repo). Run by home-assistant-update.timer.
+IMAGE=ghcr.io/home-assistant/home-assistant:stable
+
+log() { logger -t home-assistant-update "$*"; }
+
+if ! timeout 30m docker pull -q "$IMAGE" >/dev/null; then
+    log "pull failed, keeping the current version"
+    exit 0
+fi
+latest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null)
+running=$(docker inspect --format '{{.Image}}' homeassistant 2>/dev/null)
+if [ -n "$latest" ] && [ -n "$running" ] && [ "$latest" != "$running" ]; then
+    log "new Home Assistant version, restarting it"
+    systemctl restart home-assistant.service
+    docker image prune -f >/dev/null
+fi
+EOF
+
+    put /etc/systemd/system/home-assistant-update.service 644 << 'EOF' && UNITS_CHANGED=1
+[Unit]
+Description=Update the Home Assistant container
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/home-assistant-update.sh
+TimeoutStartSec=45min
+Nice=10
+EOF
+
+    # Monday night, after the app update (3:30) and the OS reboot slot (4:00)
+    put /etc/systemd/system/home-assistant-update.timer 644 << 'EOF' && UNITS_CHANGED=1
+[Unit]
+Description=Weekly Home Assistant update
+
+[Timer]
+OnCalendar=Mon *-*-* 04:30
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
+EOF
+fi
+
 # ─── Apply ───────────────────────────────────────────────────────────────────
 
 if [ "$UNITS_CHANGED" -eq 1 ]; then
@@ -332,6 +500,17 @@ if [ "$UNITS_CHANGED" -eq 1 ]; then
 fi
 systemctl enable --quiet departure-display.service
 systemctl enable --quiet --now app-update.timer network-watchdog.timer
+
+if [ -f "$HA_UNIT" ]; then
+    systemctl enable --quiet home-assistant.service
+    systemctl enable --quiet --now home-assistant-update.timer
+    # --no-block: never make an app update wait for the image download.
+    if [ "$HA_UNIT_CHANGED" -eq 1 ] && systemctl is-active --quiet home-assistant; then
+        systemctl restart --no-block home-assistant && echo "restarting home-assistant (unit changed)"
+    else
+        systemctl start --no-block home-assistant
+    fi
+fi
 
 if [ "$NM_CHANGED" -eq 1 ] && systemctl is-active --quiet NetworkManager; then
     systemctl reload NetworkManager || true

@@ -50,3 +50,29 @@ Flows worth driving: kinetic scroll on home (drag viewport), drag starting on a
 result row (must scroll, never select — including after a 400ms finger rest),
 tap a row (must select), populate/refresh during a drag (must defer), virtual
 keyboard typing with shift, sleep overlay tap-to-wake.
+
+## Heating screen (Home Assistant)
+
+Verify against a real Home Assistant, not only the `FakeHomeAssistant` in the tests.
+
+- **Get one running.** Either `pip install homeassistant` in a venv and `hass -c <dir>`,
+  or start `dockerd` and run the container with the exact `ExecStart` from
+  `pi-system.sh`. In a cloud sandbox `ghcr.io` blobs are blocked: pull
+  `homeassistant/home-assistant:stable` from Docker Hub and `docker tag` it.
+- **Config:** take the seed `configuration.yaml` from `pi-system.sh` (the
+  `trusted_networks` block is what lets the app sign in) and append test
+  thermostats: `generic_thermostat` on an `input_boolean` heater and an
+  `input_number` target sensor.
+- **Create the account** without a browser:
+  `POST /api/onboarding/users` with `client_id`, `name`, `username`, `password`, `language`.
+  Before that, the app must report `ha.ONBOARDING`.
+- **Show the button:** run the app with `HA_URL=http://127.0.0.1:8123` (off the Pi,
+  `ha.is_configured()` is otherwise false). `ha.py` uses `requests.request`, so
+  stubbing `requests.get` for IDFM leaves it working.
+- Delete `ha_auth.json` between instances: it holds a refresh token for one of them.
+- Icons: a glyph can render in `offscreen` and not under `xcb` (U+E1FF did). Check
+  new icons in an `xcb` screenshot.
+
+Flows worth driving: tap + several times (display follows at once, one command
+after ~0.8 s), mode button through to Arrêt and back, a refresh while a change is
+pending (must not flip back), back button, idle return to home.

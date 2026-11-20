@@ -22,6 +22,7 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 - **Sleep mode**: Turns screen off after configurable idle time (5/10/30 min), tap to wake. While asleep the app keeps refreshing every 5 min, so departures show the instant it wakes and the WiFi link never sits idle
 - **Night screen**: During the 2am-5am refresh pause the display sleeps instead of showing stale data, and wakes automatically at 5am
 - **Kiosk mode**: Auto-fullscreen and hidden cursor on Raspberry Pi
+- **Heating**: Radiator valves driven from the touchscreen (room temperature, target −/+, mode), through a Home Assistant running on the same Pi — see [Radiators](#radiators-home-assistant)
 - **Field debugging**: Rotating log file (`app.log`) next to the app
 
 ## Architecture
@@ -29,8 +30,9 @@ Shows upcoming departures for your saved stops with live countdowns, line badges
 | File | Role |
 |---|---|
 | `main.py` | Entry point, MainWindow, timers, navigation, sleep mode |
-| `widgets/` | UI widgets, one module per screen: `home.py`, `search.py`, `settings.py`, `keyboard.py`, plus shared touch helpers in `common.py` |
+| `widgets/` | UI widgets, one module per screen: `home.py`, `search.py`, `settings.py`, `heating.py`, `keyboard.py`, plus shared touch helpers in `common.py` |
 | `api.py` | QThread-based API workers (SIRI Lite departures and traffic info, IDFM Open Data, WiFi) |
+| `ha.py` | Home Assistant client and workers (sign-in, radiator state, commands) |
 | `models.py` | Dataclasses, shared helpers, JSON persistence (atomic writes) |
 | `styles.py` | QSS theme stylesheets and Material Icons helpers |
 
@@ -142,13 +144,50 @@ ssh pi@<pi-ip>
 /home/pi/app/update.sh
 ```
 
+## Radiators (Home Assistant)
+
+The Pi can also drive Zigbee thermostatic radiator valves. Built for SONOFF TRVZB valves with a SONOFF ZBDongle-P (CC2652P) Zigbee stick; any thermostat Home Assistant exposes as a `climate` entity shows up the same way.
+
+### What gets installed
+
+On a Pi 4 with at least 2 GB of RAM and 9 GB free on the SD card, `pi-system.sh` installs Docker and runs [Home Assistant Container](https://www.home-assistant.io/installation/) next to the display (`home-assistant.service`). Nothing to do by hand: it arrives with the next app update, and the first start downloads about 700 MB (a few GB once unpacked). On a smaller Pi nothing is installed and the heating button never appears; `journalctl -u app-update` says why.
+
+- Configuration and data live in `/home/pi/homeassistant`. `configuration.yaml` is written once and is then yours to edit.
+- Home Assistant updates itself every Monday around 4:30am (`home-assistant-update.timer`).
+- It runs with half the CPU priority of the display, and keeps one week of history to spare the SD card.
+- The touchscreen app signs in by itself: Home Assistant trusts connections coming from the Pi itself (`trusted_networks` limited to `127.0.0.1`), so there is no token to type. Other devices still need the account password.
+
+### First-time setup
+
+1. Once Home Assistant is installed, a thermometer button appears in the home screen header. Until your account exists, the heating screen shows the address to open.
+2. From a phone or a computer on the same network, open `http://<pi-ip>:8123` and create your account.
+3. Plug the Zigbee stick into a **USB 2 (black) port, on its extension cable**: the Pi 4's USB 3 ports jam the 2.4 GHz band. Home Assistant restarts by itself to see the stick, then offers the Zigbee integration under *Settings > Devices & services*.
+4. Add each valve from the Zigbee integration (*Add device*, with the valve in pairing mode), and name the device after its room.
+5. The radiators now show on the touchscreen.
+
+### On the touchscreen
+
+Each radiator has its room temperature, a −/+ target, and a mode button: *Manuel* holds the target you set, *Programme* follows the valve's own schedule, *Arrêt* closes it. Taps are sent as one command once you stop tapping. Left alone for two minutes, the screen returns to the departures.
+
+Schedules, automations and anything beyond these three controls are done in Home Assistant's own interface.
+
+### Home Assistant running elsewhere
+
+To control a Home Assistant on another machine, set its address and a long-lived access token in `.env`:
+
+```
+HA_URL=http://192.168.1.20:8123
+HA_TOKEN=your-long-lived-token
+```
+
 ## Project Structure
 
 ```
 .
 ├── main.py                       App entry point
-├── widgets/                      PyQt5 UI widgets (home, search, settings, keyboard)
+├── widgets/                      PyQt5 UI widgets (home, search, settings, heating, keyboard)
 ├── api.py                        API workers (SIRI Lite, IDFM Open Data, WiFi)
+├── ha.py                         Home Assistant client (radiators)
 ├── models.py                     Dataclasses and persistence
 ├── styles.py                     QSS stylesheets + icon helpers
 ├── MaterialIcons-Regular.ttf     Material Icons font (Google)

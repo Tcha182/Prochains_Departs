@@ -31,6 +31,7 @@ class Icons:
     WARNING = "\ue002"      # warning
     ARROW_UP = "\ue5d8"     # arrow_upward
     ARROW_DOWN = "\ue5db"   # arrow_downward
+    THERMOSTAT = "\uf076"   # thermostat
 
 
 def load_icon_font():
@@ -232,6 +233,85 @@ _SETTINGS_QSS_LIGHT = """
     background-color: #218739;
 }
 """
+
+# ─── Heating-screen selectors (one template, filled per theme) ────────────────
+
+_HEATING_QSS = """
+/* ── Heating screen ── */
+#radiatorCard {
+    background-color: transparent;
+    border: 1px solid %(border)s;
+    border-radius: 10px;
+    margin: 0 8px;
+}
+#radiatorName {
+    color: %(text)s;
+    font-size: 19px;
+    font-weight: bold;
+}
+#radiatorInfo {
+    color: %(muted)s;
+    font-size: 14px;
+}
+#radiatorTarget {
+    color: %(text)s;
+    font-size: 32px;
+    font-weight: bold;
+}
+#radiatorTarget:disabled {
+    color: %(faint)s;
+}
+#tempBtn {
+    background-color: %(button)s;
+    border: none;
+    border-radius: 10px;
+    color: %(text)s;
+    font-size: 30px;
+    font-weight: bold;
+    min-width: 64px;
+    max-width: 64px;
+    min-height: 64px;
+    max-height: 64px;
+}
+#tempBtn:pressed {
+    background-color: %(pressed)s;
+}
+#tempBtn:disabled {
+    color: %(faint)s;
+}
+#radiatorModeBtn {
+    background-color: transparent;
+    border: 1px solid %(border)s;
+    border-radius: 10px;
+    color: %(muted)s;
+    font-size: 15px;
+    font-weight: bold;
+    min-width: 112px;
+    max-width: 112px;
+    min-height: 64px;
+    max-height: 64px;
+}
+#radiatorModeBtn:pressed {
+    background-color: %(pressed)s;
+}
+#radiatorModeBtn:disabled {
+    color: %(faint)s;
+}
+#heatingMessage {
+    color: %(muted)s;
+    font-size: 17px;
+    padding: 0 24px;
+}
+"""
+
+_HEATING_QSS_DARK = _HEATING_QSS % {
+    "border": "#30363d", "text": "#e6edf3", "muted": "#8b949e",
+    "faint": "#484f58", "button": "#21262d", "pressed": "#30363d",
+}
+_HEATING_QSS_LIGHT = _HEATING_QSS % {
+    "border": "#d0d7de", "text": "#1f2328", "muted": "#656d76",
+    "faint": "#afb8c1", "button": "#eaeef2", "pressed": "#d0d7de",
+}
 
 # ─── Dark theme ───────────────────────────────────────────────────────────────
 
@@ -541,7 +621,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
 #settingsRow[tapFlash="true"], #modeBtn[tapFlash="true"] {
     background-color: #21262d;
 }
-""" + _SETTINGS_QSS_DARK
+""" + _SETTINGS_QSS_DARK + _HEATING_QSS_DARK
 
 # ─── Light theme ──────────────────────────────────────────────────────────────
 
@@ -851,7 +931,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
 #settingsRow[tapFlash="true"], #modeBtn[tapFlash="true"] {
     background-color: #eaeef2;
 }
-""" + _SETTINGS_QSS_LIGHT
+""" + _SETTINGS_QSS_LIGHT + _HEATING_QSS_LIGHT
 
 # ─── Theme colors for inline style overrides ─────────────────────────────────
 
@@ -862,6 +942,7 @@ THEME_COLORS = {
         "countdown_departed": "#f85149",
         "edit_active_bg": "#30363d",
         "edit_active_fg": "#f0f6fc",
+        "heating_active": "#f0883e",
     },
     "light": {
         "countdown_normal": "#1f2328",
@@ -869,6 +950,7 @@ THEME_COLORS = {
         "countdown_departed": "#cf222e",
         "edit_active_bg": "#d0d7de",
         "edit_active_fg": "#1f2328",
+        "heating_active": "#bc4c00",
     },
 }
 

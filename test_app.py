@@ -47,8 +47,11 @@ def no_network(request):
         yield
         return
     import requests as _requests
+    # requests.request is what ha.py (Home Assistant) goes through.
     with patch("api.requests.get",
-               side_effect=_requests.ConnectionError("network disabled in tests")):
+               side_effect=_requests.ConnectionError("network disabled in tests")), \
+            patch("ha.requests.request",
+                  side_effect=_requests.ConnectionError("network disabled in tests")):
         yield
 
 
@@ -2661,3 +2664,519 @@ class TestWiFiStatus:
             {"ssid": "Box", "signal": 70, "security": "WPA2", "in_use": True}])
         assert s.wifi_row_status.text() == "Connecté · Box"
         assert s.wifi_status.text() == "Connecté à Box"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEATING (Home Assistant)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import ha
+from models import Radiator
+from widgets import HeatingScreen, RadiatorCard
+
+
+def climate_state(entity_id="climate.salon", state="heat", name="Salon",
+                  current=19.5, target=20.0, action="idle",
+                  modes=("heat", "auto", "off")):
+    return {
+        "entity_id": entity_id, "state": state,
+        "attributes": {
+            "friendly_name": name, "hvac_modes": list(modes),
+            "min_temp": 4.0, "max_temp": 35.0, "target_temp_step": 0.5,
+            "current_temperature": current, "temperature": target,
+            "hvac_action": action,
+        },
+    }
+
+
+def make_radiator(**kwargs):
+    defaults = dict(entity_id="climate.salon", name="Salon", mode="heat",
+                    modes=["heat", "auto", "off"], current_temp=19.5,
+                    target_temp=20.0, min_temp=4.0, max_temp=35.0, step=0.5)
+    defaults.update(kwargs)
+    return Radiator(**defaults)
+
+
+class FakeHomeAssistant:
+    """Stands in for requests.request: just enough of Home Assistant's
+    auth and REST API, behaving as the real one was observed to."""
+
+    def __init__(self, users=("user-1",), bypass=True, provider=True):
+        self.users = list(users)
+        self.bypass = bypass
+        self.provider = provider
+        self.refresh_tokens = set()
+        self.access_tokens = set()
+        self.states = [climate_state()]
+        self.calls = []  # (method, path)
+        self.services = []  # (path, json)
+        self._n = 0
+
+    def _resp(self, status, payload=None):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.json.return_value = payload
+        return resp
+
+    def _issue(self, with_refresh):
+        self._n += 1
+        access = f"access-{self._n}"
+        self.access_tokens.add(access)
+        payload = {"access_token": access, "expires_in": 1800}
+        if with_refresh:
+            payload["refresh_token"] = f"refresh-{self._n}"
+            self.refresh_tokens.add(payload["refresh_token"])
+        return self._resp(200, payload)
+
+    def __call__(self, method, url, headers=None, timeout=None, json=None,
+                 data=None):
+        path = url.replace(ha.HA_URL, "")
+        self.calls.append((method, path))
+        if path == "/auth/login_flow":
+            if not self.provider:
+                return self._resp(500)
+            if self.bypass and len(self.users) == 1:
+                return self._resp(200, {"type": "create_entry", "result": "code"})
+            return self._resp(200, {
+                "type": "form", "flow_id": "flow-1", "step_id": "init",
+                "data_schema": [{"type": "select", "name": "user",
+                                 "options": [[u, u] for u in self.users]}]})
+        if path == "/auth/login_flow/flow-1":
+            assert json["user"] in self.users
+            return self._resp(200, {"type": "create_entry", "result": "code"})
+        if path == "/auth/token":
+            if data["grant_type"] == "authorization_code":
+                return self._issue(with_refresh=True)
+            if data["refresh_token"] in self.refresh_tokens:
+                return self._issue(with_refresh=False)
+            return self._resp(400, {"error": "invalid_grant"})
+        token = (headers or {}).get("Authorization", "").replace("Bearer ", "")
+        if token not in self.access_tokens:
+            return self._resp(401)
+        if path == "/api/states":
+            return self._resp(200, self.states)
+        if path.startswith("/api/services/"):
+            self.services.append((path, json))
+            return self._resp(200, [])
+        return self._resp(404)
+
+    def count(self, path):
+        return sum(1 for _, p in self.calls if p == path)
+
+
+@pytest.fixture
+def fake_ha(tmp_path):
+    """A fake Home Assistant, with the app's sign-in state starting empty."""
+    server = FakeHomeAssistant()
+    ha._forget_access_token()
+    with patch("ha.requests.request", side_effect=server), \
+            patch("ha.AUTH_PATH", str(tmp_path / "ha_auth.json")), \
+            patch("ha.HA_TOKEN", ""):
+        yield server
+    ha._forget_access_token()
+
+
+class TestRadiatorParsing:
+    def test_keeps_only_thermostats_sorted_by_name(self):
+        states = [
+            climate_state("climate.salon", name="Salon"),
+            {"entity_id": "sensor.salon_battery", "state": "87", "attributes": {}},
+            climate_state("climate.chambre", name="Chambre"),
+        ]
+        radiators = ha.parse_radiators(states)
+        assert [r.name for r in radiators] == ["Chambre", "Salon"]
+
+    def test_fields(self):
+        r = ha.parse_radiators([climate_state(action="heating")])[0]
+        assert r.entity_id == "climate.salon"
+        assert (r.mode, r.current_temp, r.target_temp) == ("heat", 19.5, 20.0)
+        assert (r.min_temp, r.max_temp, r.step) == (4.0, 35.0, 0.5)
+        assert r.modes == ["heat", "auto", "off"]
+        assert r.available and r.heating
+
+    def test_unavailable_valve(self):
+        state = climate_state(state="unavailable", current=None, target=None)
+        r = ha.parse_radiators([state])[0]
+        assert not r.available
+        assert r.mode == "" and r.target_temp is None
+
+    def test_thermostat_suffix_is_dropped_from_the_name(self):
+        states = [climate_state(name="Salon Thermostat"),
+                  climate_state("climate.t", name="Thermostat")]
+        assert sorted(r.name for r in ha.parse_radiators(states)) == [
+            "Salon", "Thermostat"]
+
+    def test_missing_attributes_fall_back(self):
+        r = ha.parse_radiators([{"entity_id": "climate.bureau", "state": "heat"}])[0]
+        assert r.name == "bureau"
+        assert (r.min_temp, r.max_temp, r.step) == (5.0, 30.0, 0.5)
+
+
+class TestHomeAssistantSignIn:
+    def test_signs_in_without_password_and_keeps_refresh_token(self, fake_ha):
+        radiators = ha.fetch_radiators()
+        assert [r.name for r in radiators] == ["Salon"]
+        with open(ha.AUTH_PATH) as f:
+            assert json.load(f)["refresh_token"] == "refresh-1"
+        if os.name == "posix":
+            assert os.stat(ha.AUTH_PATH).st_mode & 0o777 == 0o600
+
+    def test_access_token_is_reused(self, fake_ha):
+        ha.fetch_radiators()
+        ha.fetch_radiators()
+        assert fake_ha.count("/auth/login_flow") == 1
+        assert fake_ha.count("/auth/token") == 1
+
+    def test_picks_a_user_when_asked(self, fake_ha):
+        fake_ha.users = ["owner", "guest"]
+        assert ha.fetch_radiators()
+        assert fake_ha.count("/auth/login_flow/flow-1") == 1
+
+    def test_no_account_yet_means_onboarding(self, fake_ha):
+        fake_ha.users = []
+        with pytest.raises(ha.HAError) as err:
+            ha.fetch_radiators()
+        assert err.value.status == ha.ONBOARDING
+
+    def test_provider_not_enabled(self, fake_ha):
+        fake_ha.provider = False
+        with pytest.raises(ha.HAError) as err:
+            ha.fetch_radiators()
+        assert err.value.status == ha.AUTH
+
+    def test_restart_uses_stored_refresh_token(self, fake_ha):
+        ha.fetch_radiators()
+        ha._forget_access_token()  # what a new process starts with
+        ha.fetch_radiators()
+        assert fake_ha.count("/auth/login_flow") == 1  # no second sign-in
+
+    def test_rejected_refresh_token_signs_in_again(self, fake_ha):
+        ha.fetch_radiators()
+        ha._forget_access_token()
+        fake_ha.refresh_tokens.clear()  # e.g. Home Assistant reinstalled
+        assert ha.fetch_radiators()
+        assert fake_ha.count("/auth/login_flow") == 2
+
+    def test_refused_access_token_is_renewed_once(self, fake_ha):
+        ha.fetch_radiators()
+        fake_ha.access_tokens.clear()
+        assert ha.fetch_radiators()
+
+    def test_refresh_token_of_another_instance_is_ignored(self, fake_ha):
+        with open(ha.AUTH_PATH, "w") as f:
+            json.dump({"url": "http://elsewhere:8123", "refresh_token": "x"}, f)
+        ha.fetch_radiators()
+        assert fake_ha.count("/auth/login_flow") == 1
+
+    def test_long_lived_token_skips_sign_in(self, fake_ha):
+        fake_ha.access_tokens.add("long-lived")
+        with patch("ha.HA_TOKEN", "long-lived"):
+            assert ha.fetch_radiators()
+        assert fake_ha.count("/auth/login_flow") == 0
+
+    def test_unreachable(self):
+        ha._forget_access_token()
+        with patch("ha.HA_TOKEN", "token"), pytest.raises(ha.HAError) as err:
+            ha.fetch_radiators()  # network is disabled by the autouse fixture
+        assert err.value.status == ha.UNREACHABLE
+
+
+class TestHeatingWorkers:
+    def test_fetch_reports_radiators(self, fake_ha):
+        got = []
+        worker = ha.HeatingWorker()
+        worker.finished.connect(lambda *args: got.append(args))
+        worker.run()
+        status, radiators, _ = got[0]
+        assert status == ha.OK and radiators[0].name == "Salon"
+
+    def test_fetch_reports_status_on_failure(self, fake_ha):
+        fake_ha.users = []
+        got = []
+        worker = ha.HeatingWorker()
+        worker.finished.connect(lambda *args: got.append(args))
+        worker.run()
+        assert got[0][0] == ha.ONBOARDING and got[0][1] == []
+
+    def test_command_sends_mode_then_temperature(self, fake_ha):
+        got = []
+        worker = ha.HeatingCommandWorker("climate.salon", temperature=21.5,
+                                         mode="heat")
+        worker.finished.connect(lambda *args: got.append(args))
+        worker.run()
+        assert got == [("climate.salon", True)]
+        assert fake_ha.services == [
+            ("/api/services/climate/set_hvac_mode",
+             {"entity_id": "climate.salon", "hvac_mode": "heat"}),
+            ("/api/services/climate/set_temperature",
+             {"entity_id": "climate.salon", "temperature": 21.5}),
+        ]
+
+    def test_command_failure_is_reported(self):
+        ha._forget_access_token()
+        got = []
+        worker = ha.HeatingCommandWorker("climate.salon", temperature=21.0)
+        worker.finished.connect(lambda *args: got.append(args))
+        with patch("ha.HA_TOKEN", "token"):
+            worker.run()
+        assert got == [("climate.salon", False)]
+
+
+class TestRadiatorCard:
+    def _signals(self, card):
+        temps, modes = [], []
+        card.temperature_requested.connect(lambda e, t: temps.append((e, t)))
+        card.mode_requested.connect(lambda e, m: modes.append((e, m)))
+        return temps, modes
+
+    def test_shows_state(self):
+        card = RadiatorCard(make_radiator(heating=True))
+        assert card.name_label.text() == "Salon"
+        assert card.target_label.text() == "20,0°"
+        assert "19,5 °C" in card.info_label.text()
+        assert "chauffe" in card.info_label.text()
+        assert card.mode_btn.text() == "Manuel"
+
+    def test_taps_are_sent_as_one_command(self):
+        card = RadiatorCard(make_radiator())
+        temps, _ = self._signals(card)
+        card.plus_btn.click()
+        card.plus_btn.click()
+        card.plus_btn.click()
+        assert card.target_label.text() == "21,5°"  # display follows at once
+        assert temps == [] and card._temp_timer.isActive()
+        card._temp_timer.timeout.emit()
+        assert temps == [("climate.salon", 21.5)]
+
+    def test_back_to_the_current_value_sends_nothing(self):
+        card = RadiatorCard(make_radiator())
+        temps, _ = self._signals(card)
+        card.plus_btn.click()
+        card.minus_btn.click()
+        card._temp_timer.timeout.emit()
+        assert temps == []
+
+    def test_stays_within_range(self):
+        card = RadiatorCard(make_radiator(target_temp=34.5))
+        card.plus_btn.click()
+        assert card.target_label.text() == "35,0°"
+        assert not card.plus_btn.isEnabled()
+        card.plus_btn.click()
+        assert card._target == 35.0
+
+    def test_lands_on_a_multiple_of_the_step(self):
+        card = RadiatorCard(make_radiator(target_temp=19.3))
+        card.plus_btn.click()
+        assert card._target == 20.0
+
+    def test_refresh_does_not_undo_a_pending_change(self):
+        card = RadiatorCard(make_radiator())
+        card.plus_btn.click()
+        # The valve hasn't picked the command up yet: still 20.0 there.
+        card.update_from(make_radiator(target_temp=20.0))
+        assert card.target_label.text() == "20,5°"
+        # Once it reports the new value, the hold is over...
+        card.update_from(make_radiator(target_temp=20.5))
+        assert card._hold_until == 0.0
+        # ...and a change made elsewhere (phone, schedule) shows up.
+        card.update_from(make_radiator(target_temp=17.0))
+        assert card.target_label.text() == "17,0°"
+
+    def test_hold_expires(self):
+        card = RadiatorCard(make_radiator())
+        card.plus_btn.click()
+        card._hold_until = time.monotonic() - 1
+        card.update_from(make_radiator(target_temp=20.0))
+        assert card.target_label.text() == "20,0°"
+
+    def test_mode_cycles_through_what_the_valve_supports(self):
+        card = RadiatorCard(make_radiator())
+        _, modes = self._signals(card)
+        card.mode_btn.click()
+        assert card.mode_btn.text() == "Programme"
+        card.mode_btn.click()
+        assert card.mode_btn.text() == "Arrêt"
+        card._mode_timer.timeout.emit()
+        assert modes == [("climate.salon", "off")]
+
+    def test_full_mode_cycle_sends_nothing(self):
+        card = RadiatorCard(make_radiator())
+        _, modes = self._signals(card)
+        for _ in range(3):
+            card.mode_btn.click()
+        card._mode_timer.timeout.emit()
+        assert modes == []
+
+    def test_unsupported_modes_are_skipped(self):
+        card = RadiatorCard(make_radiator(modes=["heat", "off", "cool"]))
+        card.mode_btn.click()
+        assert card.mode_btn.text() == "Arrêt"
+        card.mode_btn.click()
+        assert card.mode_btn.text() == "Manuel"
+
+    def test_off_hides_target_and_disables_buttons(self):
+        card = RadiatorCard(make_radiator(mode="off"))
+        assert card.target_label.text() == "—"
+        assert not card.plus_btn.isEnabled() and not card.minus_btn.isEnabled()
+        assert card.mode_btn.isEnabled()  # the way back on
+
+    def test_unreachable_valve_is_not_adjustable(self):
+        card = RadiatorCard(make_radiator(available=False, mode="",
+                                          target_temp=None, current_temp=None))
+        assert card.info_label.text() == "Injoignable"
+        assert not card.plus_btn.isEnabled()
+        assert not card.mode_btn.isEnabled()
+
+
+class TestHeatingScreen:
+    def test_radiators_replace_the_message(self):
+        screen = HeatingScreen()
+        screen.show_loading()
+        assert screen.message_label.text() == "Chargement..."
+        screen.set_state(ha.OK, [make_radiator()])
+        assert list(screen.cards) == ["climate.salon"]
+        assert screen.message_label.isHidden() and not screen.scroll.isHidden()
+        assert "Mis à jour" in screen.status_label.text()
+
+    def test_refresh_updates_cards_in_place(self):
+        screen = HeatingScreen()
+        screen.set_state(ha.OK, [make_radiator()])
+        card = screen.cards["climate.salon"]
+        screen.set_state(ha.OK, [make_radiator(target_temp=22.0)])
+        assert screen.cards["climate.salon"] is card
+        assert card.target_label.text() == "22,0°"
+
+    def test_new_radiator_rebuilds_the_list(self):
+        screen = HeatingScreen()
+        screen.set_state(ha.OK, [make_radiator()])
+        screen.set_state(ha.OK, [
+            make_radiator(entity_id="climate.chambre", name="Chambre"),
+            make_radiator()])
+        assert list(screen.cards) == ["climate.chambre", "climate.salon"]
+
+    def test_card_requests_are_relayed(self):
+        screen = HeatingScreen()
+        got = []
+        screen.temperature_requested.connect(lambda e, t: got.append((e, t)))
+        screen.set_state(ha.OK, [make_radiator()])
+        card = screen.cards["climate.salon"]
+        card.minus_btn.click()
+        card._temp_timer.timeout.emit()
+        assert got == [("climate.salon", 19.5)]
+
+    def test_account_not_created_yet(self):
+        screen = HeatingScreen()
+        with patch("ha.setup_url", return_value="http://192.168.1.20:8123"):
+            screen.set_state(ha.ONBOARDING, [])
+        assert "Créez votre compte" in screen.message_label.text()
+        assert "http://192.168.1.20:8123" in screen.message_label.text()
+
+    def test_no_radiator_paired_yet(self):
+        screen = HeatingScreen()
+        with patch("ha.setup_url", return_value="http://192.168.1.20:8123"):
+            screen.set_state(ha.OK, [])
+        assert "Aucun radiateur" in screen.message_label.text()
+        assert "http://192.168.1.20:8123" in screen.message_label.text()
+
+    def test_not_answering_yet(self):
+        screen = HeatingScreen()
+        screen.set_state(ha.UNREACHABLE, [])
+        assert "ne répond pas encore" in screen.message_label.text()
+
+    def test_hiccup_keeps_radiators_on_screen(self):
+        screen = HeatingScreen()
+        screen.set_state(ha.OK, [make_radiator()])
+        screen.set_state(ha.UNREACHABLE, [])
+        assert list(screen.cards) == ["climate.salon"]
+        assert screen.status_label.text() == "Home Assistant ne répond pas"
+
+    def test_failed_command_is_flagged_and_truth_restored(self):
+        screen = HeatingScreen()
+        screen.set_state(ha.OK, [make_radiator()])
+        card = screen.cards["climate.salon"]
+        card.plus_btn.click()
+        screen.on_command_result("climate.salon", False)
+        assert "non transmise" in screen.status_label.text()
+        screen.set_state(ha.OK, [make_radiator(target_temp=20.0)])
+        assert card.target_label.text() == "20,0°"
+
+
+class TestMainWindowHeating:
+    @patch("main.load_favourites", return_value=[])
+    def test_no_heating_button_without_home_assistant(self, mock_load):
+        from main import MainWindow
+        with patch("main.ha.is_configured", return_value=False):
+            w = MainWindow()
+        assert w.home.heating_btn.isHidden()
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_heating_button_opens_the_screen_and_polls(self, mock_load):
+        from main import MainWindow, HEATING_PAGE
+        with patch("main.ha.is_configured", return_value=True):
+            w = MainWindow()
+        assert not w.home.heating_btn.isHidden()
+        with patch.object(w, "_launch_worker") as launch:
+            w.home.heating_btn.click()
+            assert w.stack.currentIndex() == HEATING_PAGE
+            assert w.heating_timer.isActive()
+            assert isinstance(launch.call_args[0][0], ha.HeatingWorker)
+            # One fetch at a time
+            w._refresh_heating()
+            assert launch.call_count == 1
+        w._on_heating_state(ha.OK, [make_radiator()], "")
+        assert list(w.heating.cards) == ["climate.salon"]
+        w._show_home()
+        assert w.stack.currentIndex() == 0 and not w.heating_timer.isActive()
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_no_polling_away_from_the_heating_screen(self, mock_load):
+        from main import MainWindow
+        w = MainWindow()
+        with patch.object(w, "_launch_worker") as launch:
+            w._refresh_heating()
+            launch.assert_not_called()
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_card_change_sends_a_command(self, mock_load):
+        from main import MainWindow
+        w = MainWindow()
+        w.heating.set_state(ha.OK, [make_radiator()])
+        card = w.heating.cards["climate.salon"]
+        with patch.object(w, "_launch_worker") as launch:
+            card.plus_btn.click()
+            card._temp_timer.timeout.emit()
+            worker = launch.call_args[0][0]
+        assert isinstance(worker, ha.HeatingCommandWorker)
+        assert (worker.entity_id, worker.temperature, worker.mode) == (
+            "climate.salon", 20.5, None)
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_left_alone_returns_to_departures(self, mock_load):
+        from main import MainWindow, HEATING_PAGE, HEATING_IDLE_RETURN_S
+        w = MainWindow()
+        with patch.object(w, "_launch_worker"), \
+                patch.object(MainWindow, "_is_nocturnal", return_value=False):
+            w._show_heating()
+            w._on_countdown_tick()
+            assert w.stack.currentIndex() == HEATING_PAGE
+            w._last_interaction_time = time.monotonic() - HEATING_IDLE_RETURN_S - 1
+            w._on_countdown_tick()
+            assert w.stack.currentIndex() == 0
+        w.close()
+
+    @patch("main.load_favourites", return_value=[])
+    def test_sleep_from_heating_screen_wakes_on_departures(self, mock_load):
+        from main import MainWindow
+        w = MainWindow()
+        with patch.object(w, "_launch_worker"), \
+                patch.object(w, "_set_backlight"):
+            w._show_heating()
+            w._enter_sleep()
+            assert w.stack.currentIndex() == 0
+            assert not w.heating_timer.isActive()
+            w._wake_up()
+        w.close()
