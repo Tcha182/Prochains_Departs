@@ -167,9 +167,13 @@ On a Pi 4 with at least 2 GB of RAM and 9 GB free on the SD card, `pi-system.sh`
 
 ### On the touchscreen
 
-Each radiator has its room temperature, a −/+ target, and a mode button: *Manuel* holds the target you set, *Programme* follows the valve's own schedule, *Arrêt* closes it. Taps are sent as one command once you stop tapping. Left alone for two minutes, the screen returns to the departures.
+The screen follows Home Assistant's areas: first the rooms, then the radiators of the chosen room (devices without an area are under *Autres*, and a home with a single room opens on its radiators directly). Each radiator has its room temperature, a −/+ target, and a mode button: *Manuel* holds the target you set, *Programme* follows the valve's own schedule, *Arrêt* closes it. Taps are sent as one command once you stop tapping. Left alone for two minutes, the screen returns to the departures.
 
 Schedules, automations and anything beyond these three controls are done in Home Assistant's own interface.
+
+### History and statistics
+
+`ha_sync.py`, run at each system update (after boot and nightly), gives every thermostat its history sensors (`packages/chauffage_vannes.yaml` in the Home Assistant config) and rebuilds the *Chauffage* dashboard: an overview, then one view per room. To add a radiator, pair it and put it in an area; it is picked up at the next update. A dashboard you edited by hand is left alone.
 
 ### Home Assistant running elsewhere
 

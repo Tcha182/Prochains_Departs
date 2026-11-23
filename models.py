@@ -101,6 +101,7 @@ class Radiator:
     max_temp: float = 30.0
     step: float = 0.5
     heating: bool = False          # valve open right now
+    room: str = ""                 # Home Assistant area, "" if none
 
 
 def _set_aside_corrupt(path: str) -> None:

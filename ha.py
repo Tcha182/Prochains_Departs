@@ -252,8 +252,10 @@ def _number(value, default=None):
         return default
 
 
-def parse_radiators(states: list) -> list:
-    """Build Radiators from Home Assistant's state list (`climate` entities)."""
+def parse_radiators(states: list, rooms: dict = None) -> list:
+    """Build Radiators from Home Assistant's state list (`climate` entities).
+    `rooms` is {entity_id: area name}, see fetch_rooms()."""
+    rooms = rooms or {}
     radiators = []
     for state in states:
         entity_id = state.get("entity_id", "")
@@ -279,13 +281,39 @@ def parse_radiators(states: list) -> list:
             max_temp=_number(attrs.get("max_temp"), 30.0),
             step=_number(attrs.get("target_temp_step")) or 0.5,
             heating=attrs.get("hvac_action") == "heating",
+            room=rooms.get(entity_id) or "",
         ))
     radiators.sort(key=lambda r: r.name.lower())
     return radiators
 
 
+# The state list doesn't say which room a device is in; a template does.
+_ROOMS_TEMPLATE = (
+    "{% set ns = namespace(rooms={}) %}"
+    "{% for s in states.climate %}"
+    "{% set ns.rooms = dict(ns.rooms, **{s.entity_id: area_name(s.entity_id)}) %}"
+    "{% endfor %}{{ ns.rooms | to_json }}"
+)
+_last_rooms = {}  # kept so a failed lookup doesn't reshuffle the screen
+
+
+def fetch_rooms() -> dict:
+    """{entity_id: area name} for the thermostats. Rooms only organise the
+    screen: if they can't be read, the last known ones are used."""
+    global _last_rooms
+    try:
+        resp = _api("POST", "/api/template", json={"template": _ROOMS_TEMPLATE})
+        rooms = json.loads(resp.text)
+        if isinstance(rooms, dict):
+            _last_rooms = rooms
+    except (HAError, ValueError, TypeError) as e:
+        log.warning("could not read Home Assistant rooms: %s", e)
+    return _last_rooms
+
+
 def fetch_radiators() -> list:
-    return parse_radiators(_json(_api("GET", "/api/states")))
+    states = _json(_api("GET", "/api/states"))
+    return parse_radiators(states, fetch_rooms())
 
 
 def set_temperature(entity_id: str, temperature: float) -> None:

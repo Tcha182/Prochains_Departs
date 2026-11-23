@@ -2672,7 +2672,9 @@ class TestWiFiStatus:
 
 import ha
 from models import Radiator
+import ha_sync
 from widgets import HeatingScreen, RadiatorCard
+from widgets.heating import group_by_room, room_summary
 
 
 def climate_state(entity_id="climate.salon", state="heat", name="Salon",
@@ -2708,6 +2710,7 @@ class FakeHomeAssistant:
         self.refresh_tokens = set()
         self.access_tokens = set()
         self.states = [climate_state()]
+        self.rooms = {}  # {entity_id: area name}, None to fail the lookup
         self.calls = []  # (method, path)
         self.services = []  # (path, json)
         self._n = 0
@@ -2755,6 +2758,12 @@ class FakeHomeAssistant:
             return self._resp(401)
         if path == "/api/states":
             return self._resp(200, self.states)
+        if path == "/api/template":
+            if self.rooms is None:
+                return self._resp(500)
+            resp = self._resp(200)
+            resp.text = __import__("json").dumps(self.rooms)
+            return resp
         if path.startswith("/api/services/"):
             self.services.append((path, json))
             return self._resp(200, [])
@@ -3133,6 +3142,115 @@ class TestHeatingScreen:
         assert "non transmise" in screen.status_label.text()
         screen.set_state(ha.OK, [make_radiator(target_temp=20.0)])
         assert card.target_label.text() == "20,0°"
+
+
+class TestHeatingRooms:
+    def _radiators(self):
+        return [
+            make_radiator(entity_id="climate.a", name="Entrée", room="Entrée"),
+            make_radiator(entity_id="climate.b", name="Salon 1", room="Salon",
+                          heating=True),
+            make_radiator(entity_id="climate.c", name="Salon 2", room="Salon",
+                          available=False, mode="", current_temp=None),
+            make_radiator(entity_id="climate.d", name="Sans pièce"),
+        ]
+
+    def test_rooms_come_from_home_assistant(self, fake_ha):
+        fake_ha.rooms = {"climate.salon": "Séjour"}
+        assert ha.fetch_radiators()[0].room == "Séjour"
+
+    def test_failed_room_lookup_keeps_the_last_rooms(self, fake_ha):
+        fake_ha.rooms = {"climate.salon": "Séjour"}
+        ha.fetch_radiators()
+        fake_ha.rooms = None
+        assert ha.fetch_radiators()[0].room == "Séjour"
+
+    def test_groups_sorted_with_unplaced_devices_last(self):
+        groups = group_by_room(self._radiators())
+        assert [room for room, _ in groups] == ["Entrée", "Salon", "Autres"]
+
+    def test_room_summary(self):
+        salon = group_by_room(self._radiators())[1][1]
+        assert room_summary(salon) == "19,5 °C  ·  2 radiateurs  ·  chauffe  ·  1 injoignable"
+
+    def test_navigation_room_then_back(self):
+        screen = HeatingScreen()
+        screen.show()
+        left = []
+        screen.back_to_home.connect(lambda: left.append(True))
+        screen.set_state(ha.OK, self._radiators())
+        assert screen.rooms_scroll.isVisible() and not screen.scroll.isVisible()
+
+        screen.room_buttons["Salon"].click()
+        assert screen.scroll.isVisible() and screen.title_label.text() == "Salon"
+        assert screen.cards["climate.b"].isVisible()
+        assert not screen.cards["climate.a"].isVisible()
+
+        screen._on_back()
+        assert screen.rooms_scroll.isVisible() and not left
+        screen._on_back()
+        assert left
+
+    def test_refresh_stays_in_the_room(self):
+        screen = HeatingScreen()
+        screen.show()
+        screen.set_state(ha.OK, self._radiators())
+        screen.room_buttons["Salon"].click()
+        card = screen.cards["climate.b"]
+        screen.set_state(ha.OK, self._radiators())
+        assert screen.cards["climate.b"] is card
+        assert screen.title_label.text() == "Salon" and screen.scroll.isVisible()
+
+    def test_single_room_opens_directly(self):
+        screen = HeatingScreen()
+        screen.show()
+        left = []
+        screen.back_to_home.connect(lambda: left.append(True))
+        screen.set_state(ha.OK, [make_radiator(room="Salon")])
+        assert screen.scroll.isVisible() and not screen.rooms_scroll.isVisible()
+        screen._on_back()
+        assert left
+
+
+class TestHeatingSync:
+    ENTITIES = [
+        {"entity_id": "climate.sonoff_trvzb_thermostat", "device_id": "d1"},
+        {"entity_id": "climate.salon_escalier_thermostat", "device_id": "d2"},
+        {"entity_id": "climate.garage_thermostat", "device_id": "d3"},
+        {"entity_id": "climate.off", "device_id": "d3", "disabled_by": "user"},
+        {"entity_id": "sensor.other", "device_id": "d1"},
+    ]
+    DEVICES = [
+        {"id": "d1", "name": "TRVZB", "name_by_user": "Entrée", "area_id": "entree"},
+        {"id": "d2", "name": "TRVZB", "name_by_user": "Salon (escalier)", "area_id": "salon"},
+        {"id": "d3", "name": "Garage", "area_id": None},
+    ]
+    AREAS = [{"area_id": "entree", "name": "Entrée"}, {"area_id": "salon", "name": "Salon"}]
+
+    def _valves(self):
+        return ha_sync.list_valves(self.ENTITIES, self.DEVICES, self.AREAS)
+
+    def test_valves_with_rooms_unplaced_last(self):
+        assert [(v["name"], v["room"]) for v in self._valves()] == [
+            ("Entrée", "Entrée"), ("Salon (escalier)", "Salon"), ("Garage", "Autres")]
+
+    def test_existing_valves_keep_their_statistics_names(self):
+        assert self._valves()[0]["prefix"] == "radiateur_1"
+        assert self._valves()[1]["prefix"] == "radiateur_salon_escalier"
+
+    def test_package_only_covers_new_valves_and_is_valid_yaml(self):
+        yaml = pytest.importorskip("yaml")
+        text = ha_sync.build_package(self._valves())
+        data = yaml.safe_load(text)
+        ids = [s["unique_id"] for s in data["template"][1]["sensor"]]
+        assert "radiateur_salon_escalier_temperature" in ids
+        assert not any(i.startswith("radiateur_1") for i in ids)
+        assert len(data["sensor"]) == 2
+        assert "climate.salon_escalier_thermostat" in text
+
+    def test_dashboard_has_one_view_per_room(self):
+        views = ha_sync.build_dashboard(self._valves())["views"]
+        assert [v["path"] for v in views] == ["ensemble", "entree", "salon", "autres"]
 
 
 class TestMainWindowHeating:
