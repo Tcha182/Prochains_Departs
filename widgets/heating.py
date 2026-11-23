@@ -1,4 +1,5 @@
-"""Heating screen: one card per radiator (Home Assistant thermostat)."""
+"""Heating screen: the rooms (Home Assistant areas), then one card per
+radiator (Home Assistant thermostat) in the chosen room."""
 
 import time
 from datetime import datetime
@@ -23,6 +24,76 @@ MODE_LABELS = {"heat": "Manuel", "auto": "Programme", "off": "Arrêt"}
 def format_temp(value: float) -> str:
     """21.5 -> "21,5" (French decimal comma)."""
     return f"{value:.1f}".replace(".", ",")
+
+
+# Devices not placed in a Home Assistant area.
+OTHER_ROOM = "Autres"
+
+
+def room_of(radiator: Radiator) -> str:
+    return radiator.room or OTHER_ROOM
+
+
+def group_by_room(radiators: list) -> list:
+    """[(room, [radiators])] sorted by name, devices without a room last."""
+    rooms = {}
+    for radiator in radiators:
+        rooms.setdefault(room_of(radiator), []).append(radiator)
+    return sorted(rooms.items(),
+                  key=lambda item: (item[0] == OTHER_ROOM, item[0].lower()))
+
+
+def room_summary(radiators: list) -> str:
+    """One line for a room: mean temperature, heating, unreachable devices."""
+    parts = []
+    temps = [r.current_temp for r in radiators
+             if r.available and r.current_temp is not None]
+    if temps:
+        parts.append(f"{format_temp(sum(temps) / len(temps))} °C")
+    if len(radiators) > 1:
+        parts.append(f"{len(radiators)} radiateurs")
+    if any(r.available and r.heating and r.mode != "off" for r in radiators):
+        parts.append("chauffe")
+    unreachable = sum(not r.available for r in radiators)
+    if unreachable:
+        parts.append("injoignable" if len(radiators) == 1
+                     else f"{unreachable} injoignable{'s' if unreachable > 1 else ''}")
+    return "  ·  ".join(parts)
+
+
+class RoomButton(QPushButton):
+    """A room in the list: its name and a one-line summary."""
+
+    def __init__(self, room: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("roomBtn")
+        self.room = room
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(22, 8, 22, 8)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        self.name_label = QLabel(room)
+        self.name_label.setObjectName("radiatorName")
+        text.addWidget(self.name_label)
+        self.info_label = QLabel("")
+        self.info_label.setObjectName("radiatorInfo")
+        text.addWidget(self.info_label)
+        layout.addLayout(text, stretch=1)
+        chevron = QLabel("›")
+        chevron.setObjectName("roomChevron")
+        layout.addWidget(chevron)
+        # The whole row is the button.
+        for label in (self.name_label, self.info_label, chevron):
+            label.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def update_from(self, radiators: list):
+        self.info_label.setText(room_summary(radiators))
+        heating = any(r.available and r.heating and r.mode != "off"
+                      for r in radiators)
+        self.info_label.setStyleSheet(
+            f"color: {THEME_COLORS[get_theme()]['heating_active']};"
+            if heating else "")
 
 
 class RadiatorCard(QFrame):
@@ -205,7 +276,8 @@ class RadiatorCard(QFrame):
 
 
 class HeatingScreen(QWidget):
-    """Radiator list, or what is still to be set up in Home Assistant."""
+    """Rooms, then the radiators of one room, or what is still to be set up
+    in Home Assistant. With a single room, its radiators are shown directly."""
 
     back_to_home = pyqtSignal()
     refresh_requested = pyqtSignal()
@@ -215,6 +287,9 @@ class HeatingScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cards = {}  # {entity_id: RadiatorCard}, in display order
+        self.room_buttons = {}  # {room: RoomButton}, in display order
+        self._groups = []  # [(room, [Radiator])]
+        self._room = None  # room being shown, None for the list of rooms
         self._setup_ui()
 
     def _setup_ui(self):
@@ -230,12 +305,12 @@ class HeatingScreen(QWidget):
         back_btn = QPushButton(Icons.BACK)
         back_btn.setObjectName("backBtn")
         back_btn.setFont(icon_font(22))
-        back_btn.clicked.connect(self.back_to_home.emit)
+        back_btn.clicked.connect(self._on_back)
         h_layout.addWidget(back_btn)
 
-        title = QLabel("Chauffage")
-        title.setObjectName("headerTitle")
-        h_layout.addWidget(title, stretch=1)
+        self.title_label = QLabel("Chauffage")
+        self.title_label.setObjectName("headerTitle")
+        h_layout.addWidget(self.title_label, stretch=1)
 
         refresh_btn = QPushButton(Icons.REFRESH)
         refresh_btn.setObjectName("headerBtn")
@@ -250,6 +325,16 @@ class HeatingScreen(QWidget):
         self.message_label.setAlignment(Qt.AlignCenter)
         self.message_label.setWordWrap(True)
         layout.addWidget(self.message_label, stretch=1)
+
+        self.rooms_scroll = make_touch_scroll_area()
+        self.rooms_content = QWidget()
+        self.rooms_layout = QVBoxLayout(self.rooms_content)
+        self.rooms_layout.setContentsMargins(0, 6, 0, 6)
+        self.rooms_layout.setSpacing(6)
+        self.rooms_layout.addStretch()
+        self.rooms_scroll.setWidget(self.rooms_content)
+        layout.addWidget(self.rooms_scroll, stretch=1)
+        self.rooms_scroll.hide()
 
         self.scroll = make_touch_scroll_area()
         self.scroll_content = QWidget()
@@ -274,7 +359,10 @@ class HeatingScreen(QWidget):
 
     def show_loading(self):
         """Called when the screen opens, before the first answer."""
-        if not self.cards:
+        self._room = None
+        if self.cards:
+            self._apply_view()
+        else:
             self._show_message("Chargement...")
 
     def set_state(self, status: str, radiators: list, detail: str = ""):
@@ -320,8 +408,12 @@ class HeatingScreen(QWidget):
 
     def _show_message(self, text: str):
         self._clear_cards()
+        self._clear_rooms()
+        self._room = None
+        self.title_label.setText("Chauffage")
         self.message_label.setText(text)
         self.scroll.hide()
+        self.rooms_scroll.hide()
         self.message_label.show()
         self._set_status("")
 
@@ -340,14 +432,63 @@ class HeatingScreen(QWidget):
                 card.mode_requested.connect(self.mode_requested)
                 self.cards[radiator.entity_id] = card
                 self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, card)
+
+        groups = group_by_room(radiators)
+        names = [room for room, _ in groups]
+        if names != list(self.room_buttons):
+            self._clear_rooms()
+            for room in names:
+                button = RoomButton(room)
+                button.clicked.connect(lambda _=False, r=room: self._open_room(r))
+                self.room_buttons[room] = button
+                self.rooms_layout.insertWidget(self.rooms_layout.count() - 1, button)
+        self._groups = groups
+        for room, members in groups:
+            self.room_buttons[room].update_from(members)
+        if self._room not in names:
+            self._room = None
+        self._apply_view()
+
+    def _apply_view(self):
+        """Show the list of rooms, or the cards of the current room."""
         self.message_label.hide()
+        single = len(self._groups) == 1
+        if self._room is None and not single:
+            self.title_label.setText("Chauffage")
+            self.scroll.hide()
+            self.rooms_scroll.show()
+            return
+        room = self._groups[0][0] if single else self._room
+        self.title_label.setText("Chauffage" if single else room)
+        for card in self.cards.values():
+            card.setVisible(room_of(card.radiator) == room)
+        self.rooms_scroll.hide()
         self.scroll.show()
+
+    def _open_room(self, room: str):
+        self._room = room
+        self.scroll.verticalScrollBar().setValue(0)
+        self._apply_view()
+
+    def _on_back(self):
+        if self._room is not None and len(self._groups) > 1:
+            self._room = None
+            self._apply_view()
+        else:
+            self.back_to_home.emit()
 
     def _clear_cards(self):
         for card in self.cards.values():
             self.scroll_layout.removeWidget(card)
             card.deleteLater()
         self.cards = {}
+
+    def _clear_rooms(self):
+        for button in self.room_buttons.values():
+            self.rooms_layout.removeWidget(button)
+            button.deleteLater()
+        self.room_buttons = {}
+        self._groups = []
 
     def _set_status(self, text: str, error: bool = False):
         self.status_label.setText(text)

@@ -297,6 +297,20 @@ _HEATING_QSS = """
 #radiatorModeBtn:disabled {
     color: %(faint)s;
 }
+#roomBtn {
+    background-color: transparent;
+    border: 1px solid %(border)s;
+    border-radius: 10px;
+    margin: 0 8px;
+    min-height: 72px;
+}
+#roomBtn:pressed {
+    background-color: %(pressed)s;
+}
+#roomChevron {
+    color: %(muted)s;
+    font-size: 30px;
+}
 #heatingMessage {
     color: %(muted)s;
     font-size: 17px;
