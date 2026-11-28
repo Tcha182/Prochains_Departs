@@ -3214,7 +3214,7 @@ class TestHeatingRooms:
 
 class TestHeatingSync:
     ENTITIES = [
-        {"entity_id": "climate.sonoff_trvzb_thermostat", "device_id": "d1"},
+        {"entity_id": "climate.entree_thermostat", "device_id": "d1"},
         {"entity_id": "climate.salon_escalier_thermostat", "device_id": "d2"},
         {"entity_id": "climate.garage_thermostat", "device_id": "d3"},
         {"entity_id": "climate.off", "device_id": "d3", "disabled_by": "user"},
@@ -3234,8 +3234,8 @@ class TestHeatingSync:
         assert [(v["name"], v["room"]) for v in self._valves()] == [
             ("Entrée", "Entrée"), ("Salon (escalier)", "Salon"), ("Garage", "Autres")]
 
-    def test_existing_valves_keep_their_statistics_names(self):
-        assert self._valves()[0]["prefix"] == "radiateur_1"
+    def test_sensor_names_follow_the_thermostat(self):
+        assert self._valves()[0]["prefix"] == "radiateur_entree"
         assert self._valves()[1]["prefix"] == "radiateur_salon_escalier"
 
     def test_package_only_covers_new_valves_and_is_valid_yaml(self):
@@ -3244,7 +3244,7 @@ class TestHeatingSync:
         data = yaml.safe_load(text)
         ids = [s["unique_id"] for s in data["template"][1]["sensor"]]
         assert "radiateur_salon_escalier_temperature" in ids
-        assert not any(i.startswith("radiateur_1") for i in ids)
+        assert not any(i.startswith("radiateur_entree") for i in ids)
         assert len(data["sensor"]) == 2
         assert "climate.salon_escalier_thermostat" in text
 
